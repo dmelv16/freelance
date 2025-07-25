@@ -158,6 +158,34 @@ def identify_system_states(df_group):
 
     return df_group
 
+def refine_steady_state_dips(df_group, window_size=7, threshold=0.75):
+    """
+    Reclassifies brief dips from 'Steady State' back to 'Steady State'.
+
+    If a point is classified as 'Stabilizing' but is surrounded by 'Steady State'
+    points, it's likely a momentary transient dip, not a true change of state.
+    """
+    # Create a boolean mask where True means the point is in a steady state
+    is_steady_mask = (df_group['true_state'] == 'Steady State').astype(int)
+
+    # Calculate the ratio of steady state points in a rolling window
+    steady_neighbor_ratio = is_steady_mask.rolling(
+        window=window_size,
+        center=True,
+        min_periods=1
+    ).mean()
+
+    # Identify points that are 'Stabilizing' but have mostly 'Steady State' neighbors
+    reclassify_mask = (
+        (df_group['true_state'] == 'Stabilizing') & # It's a dip
+        (steady_neighbor_ratio >= threshold)       # But its neighbors are steady
+    )
+
+    # Reclassify these points back to 'Steady State'
+    df_group.loc[reclassify_mask, 'true_state'] = 'Steady State'
+
+    return df_group
+
 def refine_transient_detection_vectorized(df_group):
     """Vectorized version of transient refinement"""
     df_group = df_group.sort_values('timestamp').reset_index(drop=True)
@@ -257,6 +285,7 @@ for group_num, group_values in enumerate(unique_groups, 1):
         
         # Apply state detection
         df_group = identify_system_states(df_group)
+        df_group = refine_steady_state_dips(df_group)
         df_group = refine_transient_detection_vectorized(df_group)
         
         # Update dc1_status with corrected states
