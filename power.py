@@ -141,7 +141,24 @@ def identify_system_states(df_group):
         'Stabilizing',
         'Overvoltage'
     ]
-    
+    # --- ADD THIS FINAL DEBUG BLOCK ---
+    print("\n--- FINAL DEBUG ---")
+    # Isolate the specific object causing the error
+    problem_object = (voltage < DE_ENERGIZED_MAX).to_numpy()
+
+    print("The object causing the error is:")
+    print(problem_object)
+    print("\nIts Python type is:")
+    print(type(problem_object))
+
+    # Try to print its dtype, which will tell us if it's a NumPy/Pandas object
+    try:
+        print("\nIts dtype is:")
+        print(problem_object.dtype)
+    except AttributeError:
+        print("\nThe object has no 'dtype' attribute.")
+    print("--- END DEBUG ---\n")
+    # --- END OF DEBUG BLOCK ---    
     df_group['true_state'] = np.select(conditions, choices, default='Transient')
     
     # Handle edge cases where time_since_turn_on is NaN but voltage is high
