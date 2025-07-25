@@ -83,19 +83,20 @@ print(f"Found {len(unique_groups)} unique groups to process")
 def identify_system_states(df_group):
     """Identify true system states using a fast, vectorized approach."""
     df_group = df_group.sort_values('timestamp').reset_index(drop=True)
-    
+
     # Calculate helper columns
     df_group['time_diff_ms'] = df_group['timestamp'].diff().dt.total_seconds() * 1000
     df_group['voltage_diff'] = df_group['voltage_28v_dc1_cal'].diff()
-    
+
     # Identify turn-on events
     df_group['turn_on_event'] = (
         (df_group['voltage_28v_dc1_cal'].shift(1) < STABILIZING_MIN) &
         (df_group['voltage_28v_dc1_cal'] >= STABILIZING_MIN) &
         (df_group['voltage_diff'] > 1.0)
     )
-    df_group['system_cycle'] = df_group['turn_on_event'].cumsum()
-    
+    # Handle potential NA's in boolean column before astype/cumsum
+    df_group['system_cycle'] = df_group['turn_on_event'].fillna(False).astype(int).cumsum()
+
     # Vectorized time since turn-on
     if df_group['system_cycle'].max() > 0:
         turn_on_times = df_group.groupby('system_cycle')['timestamp'].transform('first')
@@ -103,72 +104,58 @@ def identify_system_states(df_group):
         df_group.loc[df_group['system_cycle'] == 0, 'time_since_turn_on_ms'] = np.nan
     else:
         df_group['time_since_turn_on_ms'] = np.nan
-    
+
     # Vectorized rolling stats
-    if len(df_group) > 3 and df_group['time_diff_ms'].median() > 0:
-        window_size = max(3, int(VOLTAGE_STABILITY_WINDOW_MS / df_group['time_diff_ms'].median()))
+    df_group['voltage_rolling_std'] = np.nan  # Default to NaN
+    median_time_diff = df_group['time_diff_ms'].median()
+
+    if pd.notna(median_time_diff) and median_time_diff > 0 and len(df_group) > 3:
+        window_size = max(3, int(VOLTAGE_STABILITY_WINDOW_MS / median_time_diff))
         df_group['voltage_rolling_std'] = df_group['voltage_28v_dc1_cal'].rolling(
             window=window_size, center=True, min_periods=1
         ).std()
-    else:
-        df_group['voltage_rolling_std'] = np.nan
-    
-    # Vectorized state classification using np.select
+
+    # ---- REPLACEMENT FOR NP.SELECT ----
+    # This block replaces the buggy np.select call with a robust pandas equivalent.
+
+    # 1. Define conditions as regular pandas Series
     voltage = df_group['voltage_28v_dc1_cal']
     time_since = df_group['time_since_turn_on_ms']
     voltage_std = df_group['voltage_rolling_std']
-    
-# Convert each pandas/pyarrow boolean series to a numpy array for np.select
-    conditions = [
-        (voltage.isna() | (voltage < 0.1)).to_numpy(),
-        (voltage < DE_ENERGIZED_MAX).to_numpy(),
-        (time_since.notna() & (time_since < STEADY_STATE_DELAY_MS)).to_numpy(),
-        ((voltage >= STEADY_STATE_MIN) & (voltage <= STEADY_STATE_MAX) &
-         voltage_std.notna() & (voltage_std < VOLTAGE_STABILITY_THRESHOLD) &
-         time_since.notna() & (time_since >= STEADY_STATE_DELAY_MS)).to_numpy(),
-        ((voltage >= STABILIZING_MIN) & (voltage < STEADY_STATE_MIN)).to_numpy(),
-        ((voltage >= STEADY_STATE_MIN) & voltage_std.notna() &
-         (voltage_std >= VOLTAGE_STABILITY_THRESHOLD)).to_numpy(),
-        (voltage > STEADY_STATE_MAX).to_numpy()
-    ]
-    
-    choices = [
-        'Tester Error',
-        'De-energized',
-        'Stabilizing',
-        'Steady State',
-        'Stabilizing',
-        'Stabilizing',
-        'Overvoltage'
-    ]
-    # --- ADD THIS FINAL DEBUG BLOCK ---
-    print("\n--- FINAL DEBUG ---")
-    # Isolate the specific object causing the error
-    problem_object = (voltage < DE_ENERGIZED_MAX).to_numpy()
 
-    print("The object causing the error is:")
-    print(problem_object)
-    print("\nIts Python type is:")
-    print(type(problem_object))
+    cond_tester_error = voltage.isna() | (voltage < 0.1)
+    cond_de_energized = voltage < DE_ENERGIZED_MAX
+    cond_stabilizing_time = time_since.notna() & (time_since < STEADY_STATE_DELAY_MS)
+    cond_steady_state = ((voltage >= STEADY_STATE_MIN) & (voltage <= STEADY_STATE_MAX) &
+                         voltage_std.notna() & (voltage_std < VOLTAGE_STABILITY_THRESHOLD) &
+                         time_since.notna() & (time_since >= STEADY_STATE_DELAY_MS))
+    cond_stabilizing_volt = (voltage >= STABILIZING_MIN) & (voltage < STEADY_STATE_MIN)
+    cond_stabilizing_std = ((voltage >= STEADY_STATE_MIN) & voltage_std.notna() &
+                            (voltage_std >= VOLTAGE_STABILITY_THRESHOLD))
+    cond_overvoltage = voltage > STEADY_STATE_MAX
 
-    # Try to print its dtype, which will tell us if it's a NumPy/Pandas object
-    try:
-        print("\nIts dtype is:")
-        print(problem_object.dtype)
-    except AttributeError:
-        print("\nThe object has no 'dtype' attribute.")
-    print("--- END DEBUG ---\n")
-    # --- END OF DEBUG BLOCK ---    
-    df_group['true_state'] = np.select(conditions, choices, default='Transient')
-    
+    # 2. Assign states in order of priority, from lowest to highest.
+    # Start with the default value.
+    df_group['true_state'] = 'Transient'
+
+    # The last assignment for any given row will be its final state.
+    df_group.loc[cond_overvoltage, 'true_state'] = 'Overvoltage'
+    df_group.loc[cond_stabilizing_std, 'true_state'] = 'Stabilizing'
+    df_group.loc[cond_stabilizing_volt, 'true_state'] = 'Stabilizing'
+    df_group.loc[cond_steady_state, 'true_state'] = 'Steady State'
+    df_group.loc[cond_stabilizing_time, 'true_state'] = 'Stabilizing'
+    df_group.loc[cond_de_energized, 'true_state'] = 'De-energized'
+    df_group.loc[cond_tester_error, 'true_state'] = 'Tester Error'
+    # ---- END OF REPLACEMENT BLOCK ----
+
     # Handle edge cases where time_since_turn_on is NaN but voltage is high
     mask_possible_steady = (
-        time_since.isna() & 
-        (voltage >= STEADY_STATE_MIN) & 
+        time_since.isna() &
+        (voltage >= STEADY_STATE_MIN) &
         (df_group['true_state'] == 'Transient')
     )
     df_group.loc[mask_possible_steady, 'true_state'] = 'Possible Steady State'
-    
+
     return df_group
 
 def refine_transient_detection_vectorized(df_group):
