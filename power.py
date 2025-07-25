@@ -10,10 +10,10 @@ def reduce_mem_usage(df, verbose=True):
     start_mem = df.memory_usage().sum() / 1024**2
     if verbose:
         print(f'Memory usage of dataframe: {start_mem:.2f} MB')
-    
+
     for col in df.columns:
         col_type = df[col].dtype
-        
+
         if pd.api.types.is_numeric_dtype(col_type):
             c_min = df[col].min()
             c_max = df[col].max()
@@ -31,17 +31,17 @@ def reduce_mem_usage(df, verbose=True):
                     df[col] = df[col].astype(np.float16)
                 elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
                     df[col] = df[col].astype(np.float32)
-        
+
         # Convert low-cardinality string columns to category
         elif col_type == 'object':
             if len(df[col].unique()) / len(df[col]) < 0.5:
                 df[col] = df[col].astype('category')
-    
+
     end_mem = df.memory_usage().sum() / 1024**2
     if verbose:
         print(f'Memory usage after optimization: {end_mem:.2f} MB')
         print(f'Decreased by {100 * (start_mem - end_mem) / start_mem:.1f}%')
-    
+
     return df
 
 # Configuration
@@ -140,7 +140,7 @@ def identify_system_states(df_group):
     df_group.loc[cond_stabilizing_time, 'true_state'] = 'Stabilizing'
     df_group.loc[cond_de_energized, 'true_state'] = 'De-energized'
     df_group.loc[cond_tester_error, 'true_state'] = 'Tester Error'
-    
+
     return df_group
 
 def refine_steady_state_dips(df_group, window_size=7, threshold=0.75):
@@ -156,9 +156,6 @@ def refine_steady_state_dips(df_group, window_size=7, threshold=0.75):
     df_group.loc[reclassify_mask, 'true_state'] = 'Steady State'
     return df_group
 
-# ===================================
-# UPDATED FUNCTION FOR PROBLEMATIC GROUPS
-# ===================================
 def process_and_filter_problematic_group(df_group, final_cols):
     """
     For a problematic group, identify states, keep all 'Stabilizing' data,
@@ -205,92 +202,69 @@ def process_and_filter_problematic_group(df_group, final_cols):
 # ===================================
 print("\nStarting main processing loop...")
 
-# Initialize collection lists
-aggregated_results_list = []
-cleaned_groups_list = []
-unchanged_groups_list = []
+# Initialize collection list for ONLY the problematic groups
+problematic_groups_list = []
 
 # Process each group
 for group_num, group_values in enumerate(unique_groups, 1):
     if group_num % 100 == 0:
         print(f"  Processing group {group_num}/{len(unique_groups)}...")
-    
+
     # Create group DataFrame by filtering main df
     mask = True
     for col, val in zip(group_cols, group_values):
         mask &= (df[col] == val)
     df_group = df[mask].copy()
-    
+
     if len(df_group) == 0:
         continue
-    
-    # ===== Part 1: Aggregation (Done for all groups) =====
-    agg_result = {
-        'save': group_values[0], 'unit_id': group_values[1], 'ofp': group_values[2],
-        'station': group_values[3], 'test_case': group_values[4], 'test_run': group_values[5],
-        'voltage_min': df_group['voltage_28v_dc1_cal'].min(),
-        'voltage_max': df_group['voltage_28v_dc1_cal'].max(),
-        'voltage_median': df_group['voltage_28v_dc1_cal'].median(),
-        'timestamp_min': df_group['timestamp'].min(),
-        'timestamp_max': df_group['timestamp'].max(),
-    }
-    aggregated_results_list.append(agg_result)
-    
-    # ===== Part 2: State Filtering (only for problematic groups) =====
-    is_problematic = agg_result['voltage_min'] < STEADY_STATE_MIN
-    
+
+    # Determine if the group is problematic
+    voltage_min = df_group['voltage_28v_dc1_cal'].min()
+    is_problematic = voltage_min < STEADY_STATE_MIN
+
+    # Only process and keep data from problematic groups
     if is_problematic:
-        # Process the group using the new filtering logic
+        # Add classification flags
+        df_group['classification_flag'] = np.nan
+        cond_low_steady = (df_group['dc1_status'] == 'Steady State') & (df_group['voltage_28v_dc1_cal'] < STEADY_STATE_MIN)
+        cond_high_stabilizing = (df_group['dc1_status'] == 'Stabilizing') & (df_group['voltage_28v_dc1_cal'] >= STEADY_STATE_MIN)
+        df_group.loc[cond_low_steady, 'classification_flag'] = 'Low Voltage Steady State'
+        df_group.loc[cond_high_stabilizing, 'classification_flag'] = 'High Voltage Stabilizing'
+        
+        # Update original_cols list to include the new flag column if it's not already
+        if 'classification_flag' not in original_cols:
+            original_cols.append('classification_flag')
+            
+        # Process and filter the group
         filtered_group = process_and_filter_problematic_group(df_group, original_cols)
         
-        # Add the filtered data to the list of cleaned groups
         if not filtered_group.empty:
-            cleaned_groups_list.append(filtered_group)
-    else:
-        # Group is not problematic, add it directly to the unchanged list
-        unchanged_groups_list.append(df_group)
-    
-    # Clean up memory periodically
+            problematic_groups_list.append(filtered_group)
+
     del df_group
     if group_num % 500 == 0:
         gc.collect()
 
 # ===================================
-# SAVE ALL RESULTS
+# SAVE FINAL RESULTS
 # ===================================
-print("\nProcessing complete. Saving all files...")
+print("\nProcessing complete. Saving filtered problematic data...")
 
-# Aggregated results (summarizes groups before filtering)
-result_df = pd.DataFrame(aggregated_results_list)
-result_df.to_csv('aggregated_results.csv', index=False)
-print(f"Aggregation results saved: {len(result_df)} groups summarized")
-
-# Combine all processed data
-print("\nCombining all processed data for final output...")
-
-# Create DataFrames from the lists of processed groups
-df_cleaned = pd.concat(cleaned_groups_list, ignore_index=True) if cleaned_groups_list else pd.DataFrame()
-df_unchanged = pd.concat(unchanged_groups_list, ignore_index=True) if unchanged_groups_list else pd.DataFrame()
-
-# Create the final, complete DataFrame
-df_final = pd.concat([df_cleaned, df_unchanged], ignore_index=True)
-
-if not df_final.empty:
+# Combine the filtered problematic groups into the final DataFrame
+if problematic_groups_list:
+    df_final = pd.concat(problematic_groups_list, ignore_index=True)
+    
     # Sort by the original row_id to restore the dataset's original order
     df_final = df_final.sort_values('row_id').reset_index(drop=True)
     
-    # Save the final, cleaned dataset
-    df_final.to_csv('power_data_complete_cleaned.csv', index=False)
-    
+    # Save the final dataset of problematic groups
+    df_final.to_csv('filtered_problematic_data.csv', index=False)
+
     print("\n=== PROCESSING COMPLETE ===")
-    print(f"Total rows in original dataset: {len(df):,}")
     print(f"Total rows in final dataset: {len(df_final):,}")
-    print(f"Total groups processed: {len(unique_groups)}")
-    num_problematic = len(unique_groups) - len(unchanged_groups_list)
-    print(f"Problematic groups filtered: {num_problematic}")
-    rows_dropped = len(df) - len(df_final)
-    print(f"Total rows dropped: {rows_dropped:,} ({rows_dropped/len(df)*100:.2f}%)")
+    print(f"Total problematic groups processed and saved: {len(df_final[group_cols].drop_duplicates())}")
 else:
-    print("No data was processed or kept!")
+    print("No problematic groups were found or kept, so no output file was created.")
 
 print("\nAll processing complete!")
