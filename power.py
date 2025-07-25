@@ -118,17 +118,18 @@ def identify_system_states(df_group):
     time_since = df_group['time_since_turn_on_ms']
     voltage_std = df_group['voltage_rolling_std']
     
+# Convert each pandas/pyarrow boolean series to a numpy array for np.select
     conditions = [
-        voltage.isna() | (voltage < 0.1),
-        voltage < DE_ENERGIZED_MAX,
-        time_since.notna() & (time_since < STEADY_STATE_DELAY_MS),
-        (voltage >= STEADY_STATE_MIN) & (voltage <= STEADY_STATE_MAX) & 
-        voltage_std.notna() & (voltage_std < VOLTAGE_STABILITY_THRESHOLD) & 
-        time_since.notna() & (time_since >= STEADY_STATE_DELAY_MS),
-        (voltage >= STABILIZING_MIN) & (voltage < STEADY_STATE_MIN),
-        (voltage >= STEADY_STATE_MIN) & voltage_std.notna() & 
-        (voltage_std >= VOLTAGE_STABILITY_THRESHOLD),
-        voltage > STEADY_STATE_MAX
+        (voltage.isna() | (voltage < 0.1)).to_numpy(),
+        (voltage < DE_ENERGIZED_MAX).to_numpy(),
+        (time_since.notna() & (time_since < STEADY_STATE_DELAY_MS)).to_numpy(),
+        ((voltage >= STEADY_STATE_MIN) & (voltage <= STEADY_STATE_MAX) &
+         voltage_std.notna() & (voltage_std < VOLTAGE_STABILITY_THRESHOLD) &
+         time_since.notna() & (time_since >= STEADY_STATE_DELAY_MS)).to_numpy(),
+        ((voltage >= STABILIZING_MIN) & (voltage < STEADY_STATE_MIN)).to_numpy(),
+        ((voltage >= STEADY_STATE_MIN) & voltage_std.notna() &
+         (voltage_std >= VOLTAGE_STABILITY_THRESHOLD)).to_numpy(),
+        (voltage > STEADY_STATE_MAX).to_numpy()
     ]
     
     choices = [
