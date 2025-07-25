@@ -262,50 +262,37 @@ for group_num, group_values in enumerate(unique_groups, 1):
         rows_changed = df_group['state_mismatch'].sum()
         total_rows_changed += rows_changed
         
-        # Collect state durations (fully vectorized)
-        if 'true_state' in df_group.columns:
+# Collect state durations (fully vectorized)
+        if 'true_state' in df_group.columns and not df_group['true_state'].empty:
             state_changes = df_group['true_state'] != df_group['true_state'].shift()
-            state_groups = state_changes.cumsum()
-            
-            duration_data = df_group.groupby(['true_state', state_groups]).agg({
-                'timestamp': ['min', 'max'],
-                'voltage_28v_dc1_cal': ['mean', 'std']
-            }).reset_index()
-            
+            # Give the helper series a unique name to avoid conflicts
+            state_groups = state_changes.cumsum().rename('state_group_id')
+
+            # Use named aggregation with as_index=False to create a clean, flat DataFrame directly
+            duration_data = df_group.groupby(['true_state', state_groups], as_index=False).agg(
+                timestamp_min=('timestamp', 'min'),
+                timestamp_max=('timestamp', 'max'),
+                voltage_mean=('voltage_28v_dc1_cal', 'mean'),
+                voltage_std=('voltage_28v_dc1_cal', 'std')
+            )
+
             if not duration_data.empty:
-                # Handle MultiIndex columns properly
-                # The columns will be: ('true_state', ''), ('state_groups', ''), 
-                # ('timestamp', 'min'), ('timestamp', 'max'), 
-                # ('voltage_28v_dc1_cal', 'mean'), ('voltage_28v_dc1_cal', 'std')
-                
-                # Calculate duration using the MultiIndex columns
                 duration_data['duration_seconds'] = (
-                    duration_data[('timestamp', 'max')] - 
-                    duration_data[('timestamp', 'min')]
+                    duration_data['timestamp_max'] - duration_data['timestamp_min']
                 ).dt.total_seconds()
-                
-                # Create a new DataFrame with flat column names
-                duration_flat = pd.DataFrame({
-                    'true_state': duration_data[('true_state', '')],
-                    'duration_seconds': duration_data['duration_seconds'],
-                    'voltage_mean': duration_data[('voltage_28v_dc1_cal', 'mean')],
-                    'voltage_std': duration_data[('voltage_28v_dc1_cal', 'std')]
-                })
-                
+
                 # Filter for desired states
-                duration_flat = duration_flat[
-                    duration_flat['true_state'].isin(['Steady State', 'Stabilizing', 'Transient'])
-                ]
-                
+                duration_flat = duration_data[
+                    duration_data['true_state'].isin(['Steady State', 'Stabilizing', 'Transient'])
+                ].copy() # Use .copy() to avoid potential warnings
+
                 if not duration_flat.empty:
                     # Add group identifier columns
                     for i, col in enumerate(group_cols):
                         duration_flat[col] = group_values[i]
-                    
-                    # Rename for consistency
+
+                    # Rename for consistency and append
                     duration_flat = duration_flat.rename(columns={'true_state': 'state'})
-                    
-                    # Append the entire DataFrame to the list
                     state_durations_list.append(duration_flat)
         
         # Collect change logs
