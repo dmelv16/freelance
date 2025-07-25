@@ -34,7 +34,6 @@ def reduce_mem_usage(df, verbose=True):
         
         # Convert low-cardinality string columns to category
         elif col_type == 'object':
-            # If the number of unique values is less than 50% of the total, convert to category
             if len(df[col].unique()) / len(df[col]) < 0.5:
                 df[col] = df[col].astype('category')
     
@@ -70,8 +69,11 @@ df = reduce_mem_usage(df)
 # Convert timestamp once
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-# Add row_id for tracking
+# Add row_id for tracking original order
 df['row_id'] = range(len(df))
+
+# Store original columns for later
+original_cols = df.columns.tolist()
 
 # Get unique groups from the in-memory DataFrame
 unique_groups = df[group_cols].drop_duplicates().values.tolist()
@@ -94,7 +96,6 @@ def identify_system_states(df_group):
         (df_group['voltage_28v_dc1_cal'] >= STABILIZING_MIN) &
         (df_group['voltage_diff'] > 1.0)
     )
-    # Handle potential NA's in boolean column before astype/cumsum
     df_group['system_cycle'] = df_group['turn_on_event'].fillna(False).astype(int).cumsum()
 
     # Vectorized time since turn-on
@@ -105,20 +106,16 @@ def identify_system_states(df_group):
     else:
         df_group['time_since_turn_on_ms'] = np.nan
 
-    # Vectorized rolling stats
-    df_group['voltage_rolling_std'] = np.nan  # Default to NaN
+    # Vectorized rolling stats for stability check
+    df_group['voltage_rolling_std'] = np.nan
     median_time_diff = df_group['time_diff_ms'].median()
-
     if pd.notna(median_time_diff) and median_time_diff > 0 and len(df_group) > 3:
         window_size = max(3, int(VOLTAGE_STABILITY_WINDOW_MS / median_time_diff))
         df_group['voltage_rolling_std'] = df_group['voltage_28v_dc1_cal'].rolling(
             window=window_size, center=True, min_periods=1
         ).std()
 
-    # ---- REPLACEMENT FOR NP.SELECT ----
-    # This block replaces the buggy np.select call with a robust pandas equivalent.
-
-    # 1. Define conditions as regular pandas Series
+    # Define conditions for state classification
     voltage = df_group['voltage_28v_dc1_cal']
     time_since = df_group['time_since_turn_on_ms']
     voltage_std = df_group['voltage_rolling_std']
@@ -134,11 +131,8 @@ def identify_system_states(df_group):
                             (voltage_std >= VOLTAGE_STABILITY_THRESHOLD))
     cond_overvoltage = voltage > STEADY_STATE_MAX
 
-    # 2. Assign states in order of priority, from lowest to highest.
-    # Start with the default value.
+    # Assign states in order of priority
     df_group['true_state'] = 'Transient'
-
-    # The last assignment for any given row will be its final state.
     df_group.loc[cond_overvoltage, 'true_state'] = 'Overvoltage'
     df_group.loc[cond_stabilizing_std, 'true_state'] = 'Stabilizing'
     df_group.loc[cond_stabilizing_volt, 'true_state'] = 'Stabilizing'
@@ -146,79 +140,65 @@ def identify_system_states(df_group):
     df_group.loc[cond_stabilizing_time, 'true_state'] = 'Stabilizing'
     df_group.loc[cond_de_energized, 'true_state'] = 'De-energized'
     df_group.loc[cond_tester_error, 'true_state'] = 'Tester Error'
-    # ---- END OF REPLACEMENT BLOCK ----
-
-    # Handle edge cases where time_since_turn_on is NaN but voltage is high
-    mask_possible_steady = (
-        time_since.isna() &
-        (voltage >= STEADY_STATE_MIN) &
-        (df_group['true_state'] == 'Transient')
-    )
-    df_group.loc[mask_possible_steady, 'true_state'] = 'Possible Steady State'
-
+    
     return df_group
 
 def refine_steady_state_dips(df_group, window_size=7, threshold=0.75):
-    """
-    Reclassifies brief dips from 'Steady State' back to 'Steady State'.
-
-    If a point is classified as 'Stabilizing' but is surrounded by 'Steady State'
-    points, it's likely a momentary transient dip, not a true change of state.
-    """
-    # Create a boolean mask where True means the point is in a steady state
+    """Reclassifies brief dips from 'Steady State' back to 'Steady State'."""
     is_steady_mask = (df_group['true_state'] == 'Steady State').astype(int)
-
-    # Calculate the ratio of steady state points in a rolling window
     steady_neighbor_ratio = is_steady_mask.rolling(
-        window=window_size,
-        center=True,
-        min_periods=1
-    ).mean()
-
-    # Identify points that are 'Stabilizing' but have mostly 'Steady State' neighbors
-    reclassify_mask = (
-        (df_group['true_state'] == 'Stabilizing') & # It's a dip
-        (steady_neighbor_ratio >= threshold)       # But its neighbors are steady
-    )
-
-    # Reclassify these points back to 'Steady State'
-    df_group.loc[reclassify_mask, 'true_state'] = 'Steady State'
-
-    return df_group
-
-def refine_transient_detection_vectorized(df_group):
-    """Vectorized version of transient refinement"""
-    df_group = df_group.sort_values('timestamp').reset_index(drop=True)
-    
-    # Only process if we have steady states
-    if not (df_group['true_state'] == 'Steady State').any():
-        return df_group
-    
-    # Create a rolling window count of steady states
-    window_size = 11  # 5 before + current + 5 after
-    steady_state_mask = (df_group['true_state'] == 'Steady State').astype(int)
-    steady_state_ratio = steady_state_mask.rolling(
         window=window_size, center=True, min_periods=1
     ).mean()
-    
-    # Find steady state readings that are actually transients
-    transient_mask = (
-        (df_group['true_state'] == 'Steady State') &
-        (steady_state_ratio > 0.7) &
-        ((df_group['voltage_28v_dc1_cal'] < STEADY_STATE_MIN) | 
-         (df_group['voltage_28v_dc1_cal'] > STEADY_STATE_MAX))
+    reclassify_mask = (
+        (df_group['true_state'] == 'Stabilizing') &
+        (steady_neighbor_ratio >= threshold)
     )
-    
-    df_group.loc[transient_mask, 'true_state'] = 'Transient'
-    
-    # Add transient type if available
-    if 'dc1_trans' in df_group.columns:
-        df_group.loc[transient_mask & df_group['dc1_trans'].str.contains('Normal', na=False), 
-                     'transient_type'] = 'Normal Transient'
-        df_group.loc[transient_mask & df_group['dc1_trans'].str.contains('Abnormal', na=False), 
-                     'transient_type'] = 'Abnormal Transient'
-    
+    df_group.loc[reclassify_mask, 'true_state'] = 'Steady State'
     return df_group
+
+# ===================================
+# UPDATED FUNCTION FOR PROBLEMATIC GROUPS
+# ===================================
+def process_and_filter_problematic_group(df_group, final_cols):
+    """
+    For a problematic group, identify states, keep all 'Stabilizing' data,
+    and keep the first and last 50 'Steady State' readings.
+    Discard all other states (e.g., Transient, Overvoltage).
+    """
+    # Run state detection to classify each row
+    df_group = identify_system_states(df_group)
+    df_group = refine_steady_state_dips(df_group)
+
+    # 1. Isolate all 'Stabilizing' rows
+    stabilizing_rows = df_group[df_group['true_state'] == 'Stabilizing']
+
+    # 2. Isolate and filter 'Steady State' rows
+    steady_state_rows = df_group[df_group['true_state'] == 'Steady State']
+    if len(steady_state_rows) > 100:
+        first_50 = steady_state_rows.head(50)
+        last_50 = steady_state_rows.tail(50)
+        kept_steady_rows = pd.concat([first_50, last_50])
+    else:
+        # If 100 or fewer steady state rows, keep all of them
+        kept_steady_rows = steady_state_rows
+
+    # 3. Combine the two sets of rows we want to keep
+    rows_to_keep = pd.concat([stabilizing_rows, kept_steady_rows])
+
+    # If we have any rows left, update their status and select original columns
+    if not rows_to_keep.empty:
+        # Sort by original row_id to maintain chronological order
+        rows_to_keep = rows_to_keep.sort_values('row_id')
+        rows_to_keep = rows_to_keep.copy()
+
+        # Update the status column to reflect the new classification
+        rows_to_keep['dc1_status'] = rows_to_keep['true_state']
+
+        # Return only the columns present in the original DataFrame
+        return rows_to_keep[final_cols]
+    else:
+        # If no rows are kept, return an empty DataFrame with correct columns
+        return pd.DataFrame(columns=final_cols)
 
 # ===================================
 # MAIN PROCESSING LOOP
@@ -229,19 +209,13 @@ print("\nStarting main processing loop...")
 aggregated_results_list = []
 cleaned_groups_list = []
 unchanged_groups_list = []
-state_durations_list = []
-change_logs_list = []
-group_change_summary_list = []
-
-# Track overall statistics
-total_rows_changed = 0
 
 # Process each group
 for group_num, group_values in enumerate(unique_groups, 1):
     if group_num % 100 == 0:
         print(f"  Processing group {group_num}/{len(unique_groups)}...")
     
-    # Create group DataFrame by filtering main df (very fast)
+    # Create group DataFrame by filtering main df
     mask = True
     for col, val in zip(group_cols, group_values):
         mask &= (df[col] == val)
@@ -250,111 +224,30 @@ for group_num, group_values in enumerate(unique_groups, 1):
     if len(df_group) == 0:
         continue
     
-    # ===== Part 1: Aggregation =====
+    # ===== Part 1: Aggregation (Done for all groups) =====
     agg_result = {
-        'save': group_values[0],
-        'unit_id': group_values[1],
-        'ofp': group_values[2],
-        'station': group_values[3],
-        'test_case': group_values[4],
-        'test_run': group_values[5],
+        'save': group_values[0], 'unit_id': group_values[1], 'ofp': group_values[2],
+        'station': group_values[3], 'test_case': group_values[4], 'test_run': group_values[5],
         'voltage_min': df_group['voltage_28v_dc1_cal'].min(),
         'voltage_max': df_group['voltage_28v_dc1_cal'].max(),
         'voltage_median': df_group['voltage_28v_dc1_cal'].median(),
-        'voltage_sd': df_group['voltage_28v_dc1_cal'].std(),
-        'voltage_range': df_group['voltage_28v_dc1_cal'].max() - df_group['voltage_28v_dc1_cal'].min(),
-        'current_min': df_group['current_28v_dc1_cal'].min(),
-        'current_max': df_group['current_28v_dc1_cal'].max(),
-        'current_median': df_group['current_28v_dc1_cal'].median(),
-        'current_sd': df_group['current_28v_dc1_cal'].std(),
-        'current_range': df_group['current_28v_dc1_cal'].max() - df_group['current_28v_dc1_cal'].min(),
         'timestamp_min': df_group['timestamp'].min(),
         'timestamp_max': df_group['timestamp'].max(),
-        'norm_trans': (df_group['dc1_trans'] == 'Normal Transient').sum(),
-        'abnorm_trans': (df_group['dc1_trans'] == 'Abnormal Transient').sum()
     }
-    agg_result['duration'] = agg_result['timestamp_max'] - agg_result['timestamp_min']
     aggregated_results_list.append(agg_result)
     
-    # ===== Part 2: State Detection (only for problematic groups) =====
+    # ===== Part 2: State Filtering (only for problematic groups) =====
     is_problematic = agg_result['voltage_min'] < STEADY_STATE_MIN
     
     if is_problematic:
-        # Store original status
-        df_group['dc1_status_original'] = df_group['dc1_status']
+        # Process the group using the new filtering logic
+        filtered_group = process_and_filter_problematic_group(df_group, original_cols)
         
-        # Apply state detection
-        df_group = identify_system_states(df_group)
-        df_group = refine_steady_state_dips(df_group)
-        df_group = refine_transient_detection_vectorized(df_group)
-        
-        # Update dc1_status with corrected states
-        df_group['dc1_status'] = df_group['true_state']
-        df_group['state_mismatch'] = df_group['dc1_status_original'] != df_group['dc1_status']
-        
-        # Count changes
-        rows_changed = df_group['state_mismatch'].sum()
-        total_rows_changed += rows_changed
-        
-# Collect state durations (fully vectorized)
-        if 'true_state' in df_group.columns and not df_group['true_state'].empty:
-            state_changes = df_group['true_state'] != df_group['true_state'].shift()
-            # Give the helper series a unique name to avoid conflicts
-            state_groups = state_changes.cumsum().rename('state_group_id')
-
-            # Use named aggregation with as_index=False to create a clean, flat DataFrame directly
-            duration_data = df_group.groupby(['true_state', state_groups], as_index=False).agg(
-                timestamp_min=('timestamp', 'min'),
-                timestamp_max=('timestamp', 'max'),
-                voltage_mean=('voltage_28v_dc1_cal', 'mean'),
-                voltage_std=('voltage_28v_dc1_cal', 'std')
-            )
-
-            if not duration_data.empty:
-                duration_data['duration_seconds'] = (
-                    duration_data['timestamp_max'] - duration_data['timestamp_min']
-                ).dt.total_seconds()
-
-                # Filter for desired states
-                duration_flat = duration_data[
-                    duration_data['true_state'].isin(['Steady State', 'Stabilizing', 'Transient'])
-                ].copy() # Use .copy() to avoid potential warnings
-
-                if not duration_flat.empty:
-                    # Add group identifier columns
-                    for i, col in enumerate(group_cols):
-                        duration_flat[col] = group_values[i]
-
-                    # Rename for consistency and append
-                    duration_flat = duration_flat.rename(columns={'true_state': 'state'})
-                    state_durations_list.append(duration_flat)
-        
-        # Collect change logs
-        if rows_changed > 0:
-            change_log = df_group[df_group['state_mismatch']][
-                ['row_id'] + group_cols + ['timestamp', 'voltage_28v_dc1_cal',
-                 'dc1_status_original', 'dc1_status', 'system_cycle', 'time_since_turn_on_ms']
-            ]
-            change_logs_list.append(change_log)
-        
-        # Create group summary
-        group_change_summary_list.append({
-            'save': group_values[0], 'unit_id': group_values[1],
-            'ofp': group_values[2], 'station': group_values[3],
-            'test_case': group_values[4], 'test_run': group_values[5],
-            'total_rows': len(df_group),
-            'rows_changed': rows_changed,
-            'percent_changed': (rows_changed / len(df_group) * 100) if len(df_group) > 0 else 0,
-            'voltage_min': agg_result['voltage_min'],
-            'voltage_max': agg_result['voltage_max'],
-            'voltage_mean': df_group['voltage_28v_dc1_cal'].mean(),
-            'original_steady_state_count': (df_group['dc1_status_original'] == 'Steady State').sum(),
-            'new_steady_state_count': (df_group['true_state'] == 'Steady State').sum()
-        })
-        
-        cleaned_groups_list.append(df_group)
+        # Add the filtered data to the list of cleaned groups
+        if not filtered_group.empty:
+            cleaned_groups_list.append(filtered_group)
     else:
-        # Group is unchanged
+        # Group is not problematic, add it directly to the unchanged list
         unchanged_groups_list.append(df_group)
     
     # Clean up memory periodically
@@ -367,63 +260,37 @@ for group_num, group_values in enumerate(unique_groups, 1):
 # ===================================
 print("\nProcessing complete. Saving all files...")
 
-# Aggregated results
+# Aggregated results (summarizes groups before filtering)
 result_df = pd.DataFrame(aggregated_results_list)
 result_df.to_csv('aggregated_results.csv', index=False)
-print(f"Aggregation results saved: {len(result_df)} groups")
-
-# State durations
-if state_durations_list:
-    # Concatenate all duration DataFrames
-    duration_df = pd.concat(state_durations_list, ignore_index=True)
-    duration_df.to_csv('state_duration_analysis.csv', index=False)
-    print(f"State duration analysis saved: {len(duration_df)} records")
-
-# Change logs
-if change_logs_list:
-    change_log_all = pd.concat(change_logs_list, ignore_index=True)
-    change_log_all.to_csv('state_changes_detailed.csv', index=False)
-    print(f"State changes log saved: {len(change_log_all)} changes")
-
-# Group change summary
-if group_change_summary_list:
-    change_summary_df = pd.DataFrame(group_change_summary_list)
-    change_summary_df = change_summary_df.sort_values('rows_changed', ascending=False)
-    change_summary_df.to_csv('group_change_summary.csv', index=False)
-    print(f"Group change summary saved: {len(change_summary_df)} problematic groups")
+print(f"Aggregation results saved: {len(result_df)} groups summarized")
 
 # Combine all processed data
-print("\nCombining all processed data...")
+print("\nCombining all processed data for final output...")
 
-# Create the cleaned and unchanged DataFrames first
+# Create DataFrames from the lists of processed groups
 df_cleaned = pd.concat(cleaned_groups_list, ignore_index=True) if cleaned_groups_list else pd.DataFrame()
 df_unchanged = pd.concat(unchanged_groups_list, ignore_index=True) if unchanged_groups_list else pd.DataFrame()
 
-# Create final DataFrame
+# Create the final, complete DataFrame
 df_final = pd.concat([df_cleaned, df_unchanged], ignore_index=True)
+
 if not df_final.empty:
+    # Sort by the original row_id to restore the dataset's original order
     df_final = df_final.sort_values('row_id').reset_index(drop=True)
     
-    # Create comparison statistics using already-created df_cleaned
-    if not df_cleaned.empty:
-        comparison = pd.crosstab(df_cleaned['dc1_status_original'], 
-                               df_cleaned['true_state'], margins=True)
-        print("\nState Classification Comparison:")
-        print(comparison)
-        
-        print("\nTrue State Distribution in cleaned data:")
-        print(df_cleaned['true_state'].value_counts())
-    
-    # Save final dataset
+    # Save the final, cleaned dataset
     df_final.to_csv('power_data_complete_cleaned.csv', index=False)
     
     print("\n=== PROCESSING COMPLETE ===")
-    print(f"Total rows processed: {len(df_final):,}")
-    print(f"Problematic groups processed: {len([g for g in group_change_summary_list])}")
+    print(f"Total rows in original dataset: {len(df):,}")
+    print(f"Total rows in final dataset: {len(df_final):,}")
     print(f"Total groups processed: {len(unique_groups)}")
-    print(f"Total rows with state changes: {total_rows_changed:,}")
-    print(f"Percentage of data corrected: {total_rows_changed/len(df_final)*100:.2f}%")
+    num_problematic = len(unique_groups) - len(unchanged_groups_list)
+    print(f"Problematic groups filtered: {num_problematic}")
+    rows_dropped = len(df) - len(df_final)
+    print(f"Total rows dropped: {rows_dropped:,} ({rows_dropped/len(df)*100:.2f}%)")
 else:
-    print("No data was processed!")
+    print("No data was processed or kept!")
 
 print("\nAll processing complete!")
