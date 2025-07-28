@@ -50,61 +50,67 @@ parquet_writer = None
 # Define columns that MUST be numeric
 numeric_cols = ['voltage_28v_dc1_cal', 'current_28v_dc1_cal', 'timestamp'] # Add any other known numeric cols
 
-print("Step 1: Scanning all source files to build a master schema...")
-all_fields = {}
-for file_path in file_list:
-    schema = pq.ParquetFile(file_path).schema_arrow
-    for field in schema:
-        if field.name not in all_fields:
-            all_fields[field.name] = field
-master_schema = pa.schema([field for name, field in sorted(all_fields.items())])
-print("Master schema created successfully.")
-
-
-# --- 3. Read Files, Harmonize, Sanitize, and Gather Groups ---
+# --- 3. Read Files and Gather Groups ---
 groups_data = defaultdict(list)
-# Get the list of all column names in the correct order from our master schema
-master_column_names = master_schema.names
-
-print("\nStep 2: Reading files and gathering groups...")
+print("Step 1: Reading files and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
-        # Convert the raw batch to pandas first
         chunk = batch.to_pandas()
-        
-        # --- FIX STARTS HERE ---
-        # 1. Harmonize Schema: Add any columns from the master list that are missing in this chunk
-        for col_name in master_column_names:
-            if col_name not in chunk.columns:
-                chunk[col_name] = None # Add missing column with nulls
-        
-        # 2. Ensure the column order is exactly the same as the master schema
-        chunk = chunk[master_column_names]
-        # --- FIX ENDS HERE ---
-
-        # Sanitize numeric types to fix mixed-type issues
-        for col in numeric_cols:
-            if col in chunk.columns:
-                chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
-
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
 
-print(f"\nStep 3: Cleaning each group and writing to '{output_filename}'...")
+# --- 4. Process Each Group and Write to File ---
+failed_groups = [] # Keep track of groups that cause an error
+print(f"\nStep 2: Cleaning each group and writing to '{output_filename}'...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
-    full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
-    cleaned_group_df = clean_one_group(full_group_df)
-    
-    table = pa.Table.from_pandas(cleaned_group_df, schema=master_schema, preserve_index=False)
-    
-    if parquet_writer is None:
-        parquet_writer = pq.ParquetWriter(output_filename, master_schema)
-    
-    parquet_writer.write_table(table)
+    try:
+        # --- All processing for a single group happens inside this 'try' block ---
+        
+        full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
+        
+        # Sanitize the numeric columns for this specific group
+        for col in numeric_cols:
+            if col in full_group_df.columns:
+                full_group_df[col] = pd.to_numeric(full_group_df[col], errors='coerce')
+                full_group_df[col].fillna(0, inplace=True)
+
+        cleaned_group_df = clean_one_group(full_group_df)
+        
+        table = pa.Table.from_pandas(cleaned_group_df, preserve_index=False)
+        
+        if parquet_writer is None:
+            master_schema = table.schema
+            parquet_writer = pq.ParquetWriter(output_filename, master_schema)
+        
+        table = table.cast(master_schema)
+        parquet_writer.write_table(table)
+
+    except (TypeError, ValueError, pa.ArrowInvalid) as e:
+        # --- If ANY of the above steps fail, this 'except' block will run ---
+        
+        # We print a warning and add the group to our failed list
+        print(f"\nWARNING: Skipping group {group_key} due to a data processing error.")
+        failed_groups.append(group_key)
+        # 'continue' tells the loop to immediately move on to the next group
+        continue
 
 if parquet_writer:
     parquet_writer.close()
 
 print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
+
+# --- 5. Final Summary of Skipped Groups ---
+if failed_groups:
+    print("\n" + "="*35)
+    print("      Summary of Skipped Groups")
+    print("="*35)
+    print(f"A total of {len(failed_groups)} groups were skipped due to fatal data errors.")
+    print("The first 5 skipped groups were:")
+    for group in failed_groups[:5]:
+        print(f"  - {group}")
+else:
+    print("\n--- All groups processed successfully! ---")
+
+
