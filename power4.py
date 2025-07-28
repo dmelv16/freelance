@@ -47,86 +47,68 @@ group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Air
 groups_data = defaultdict(list)
 
 print("Step 1: Reading files in chunks and gathering groups...")
-# This loop reads each file chunk by chunk without loading the whole file
 for file_path in file_list:
-    # THIS IS THE CORRECTED LOOP
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
         chunk = batch.to_pandas()
-        # Group the chunk and append each small group piece to our dictionary
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
 
 # --- 3. Process Each Group and Collect Results ---
 cleaned_dfs = []
-
 print("\nStep 2: Cleaning each group one by one...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
-    # Combine all the small pieces for this one group into a single DataFrame
     full_group_df = pd.concat(list_of_chunks)
-    
-    # Run our trusted cleaning function on the complete group
     cleaned_group = clean_one_group(full_group_df)
     cleaned_dfs.append(cleaned_group)
 
 # --- 4. Combine All Cleaned Groups ---
 print("\nStep 3: Combining all cleaned groups into the final result...")
+# The resulting DataFrame has both original 'dc1_status' and new 'Cleaned_Status'
 final_df = pd.concat(cleaned_dfs, ignore_index=True)
 print("Processing complete.")
 
-# --- 5. Summarize Changes ---
-# (This section remains the same)
-print("\n" + "="*35)
-print("        Cleaning Summary")
-print("="*35)
-changes_mask = final_df['dc1_status'] != final_df['Cleaned_Status']
-changed_rows = final_df[changes_mask]
+# --- 5. Perform and Export Before-and-After Analysis ---
+print("\n" + "="*45)
+print("  Performing Final Before-and-After Analysis")
+print("="*45)
 
-if changed_rows.empty:
-    print("No classifications were changed.")
-else:
-    change_counts = changed_rows.groupby(['dc1_status', 'Cleaned_Status']).size().reset_index(name='count')
-    change_counts.rename(columns={'dc1_status': 'Original State', 'Cleaned_Status': 'New State'}, inplace=True)
-    print("Breakdown of classification changes:")
-    print(change_counts.to_string(index=False))
-    print(f"\nTotal classifications changed: {len(changed_rows)}")
-print("="*35)
+def perform_detailed_analysis(df, status_col, voltage_col, output_filename):
+    """Groups a dataframe and calculates voltage stats, saving to CSV."""
+    # Filter for the key states
+    analysis_df = df[df[status_col].isin(['Stabilizing', 'Steady State'])]
+    
+    # Group by all the original grouping columns plus the status
+    all_analysis_groups = group_cols + [status_col]
+    
+    print(f"\nGrouping and aggregating data based on '{status_col}'...")
+    # Perform aggregation
+    summary = analysis_df.groupby(all_analysis_groups)[voltage_col].agg(
+        ['min', 'max', 'mean', 'std']
+    ).reset_index()
+    
+    # Save to CSV
+    summary.to_csv(output_filename, index=False)
+    print(f"--> Analysis successful. Results saved to '{output_filename}'")
+    return summary
 
-# Overwrite original column and drop the temp one
-final_df['dc1_status'] = final_df['Cleaned_Status']
-final_output = final_df.drop(columns=['Cleaned_Status', 'block_id'])
+# Run analysis on ORIGINAL data
+before_summary = perform_detailed_analysis(
+    df=final_df,
+    status_col='dc1_status',
+    voltage_col='voltage_28v_dc1_cal',
+    output_filename='analysis_before_cleaning.csv'
+)
 
+# Run analysis on CLEANED data
+after_summary = perform_detailed_analysis(
+    df=final_df,
+    status_col='Cleaned_Status',
+    voltage_col='voltage_28v_dc1_cal',
+    output_filename='analysis_after_cleaning.csv'
+)
 
-# --- 6. Final Voltage Analysis ---
-print("\n--- Final Analysis of Cleaned Data ---")
-
-# Filter for the statuses we want to verify
-analysis_df = final_output[final_output['dc1_status'].isin(['Stabilizing', 'Steady State'])]
-
-# Group by the cleaned status and get the min and max voltage for each
-voltage_summary = analysis_df.groupby('dc1_status')['voltage_28v_dc1_cal'].agg(['min', 'max'])
-
-print("Voltage Summary for Key States:")
-print(voltage_summary)
-
-# --- 7. Check for Sandwiched Stabilizing Points ---
-print("\n--- Sandwiched Point Analysis ---")
-
-# This function checks for the specific pattern within a series of statuses
-def find_sandwiched(status_series):
-    is_stabilizing = status_series == 'Stabilizing'
-    prev_is_steady = status_series.shift(1) == 'Steady State'
-    next_is_steady = status_series.shift(-1) == 'Steady State'
-    return is_stabilizing & prev_is_steady & next_is_steady
-
-# We run the check on each group separately to ensure accuracy
-sandwiched_mask = final_output.groupby(group_cols)['dc1_status'].transform(find_sandwiched)
-sandwiched_count = sandwiched_mask.sum()
-
-print(f"Found {sandwiched_count} 'Stabilizing' point(s) sandwiched between 'Steady State' points.")
-
-# If any are found, print them for review
-if sandwiched_count > 0:
-    print("\nRows with sandwiched 'Stabilizing' points:")
-    print(final_output[sandwiched_mask])
+print("\n--- Analysis Complete ---")
+print("\n'before_cleaning_summary.csv' contains stats on original data.")
+print("'after_cleaning_summary.csv' contains stats on cleaned data.")
