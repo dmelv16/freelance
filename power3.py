@@ -32,23 +32,23 @@ print(df.head())
 # --- 2. Define Grouping and Remove Transients ---
 group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft']
 values_to_remove = ['Error 0 volt', 'Error missing volt', 'Normal transient', 'Abnormal transient']
-
-# THIS IS THE CORRECTED LINE:
-# The .copy() is removed. This operation now creates a new Dask DataFrame 'df_cleaned'.
 df_cleaned = df[~df['dc1_trans'].isin(values_to_remove)]
 
 # --- 3. Identify Misclassified Groups WITHIN Your Full Setup ---
+# Create the block_id, which is unique WITHIN each test run group
 df_cleaned['block_id'] = df_cleaned.groupby(group_cols)['dc1_status'].transform(
     lambda x: (x != x.shift()).fillna(True).astype(int).cumsum(),
     meta=('block_id', 'int64')
 )
-df_cleaned['unique_block_id'] = df_cleaned.groupby(group_cols + ['block_id']).ngroup()
 
-group_info = df_cleaned.groupby('unique_block_id').agg(
+# THE FIX: We removed the .ngroup() line.
+# Now, we group by the list of columns that together make a unique block.
+grouping_for_agg = group_cols + ['block_id']
+group_info = df_cleaned.groupby(grouping_for_agg).agg(
     min_voltage=('voltage_28v_dc1_cal', 'min'),
     max_voltage=('voltage_28v_dc1_cal', 'max'),
     state=('dc1_status', 'first')
-).compute()
+).compute() # <-- Compute here to get the small summary table
 
 unclean_steady_ids = group_info[
     (group_info['state'] == 'Steady State') & (group_info['min_voltage'] < 22)
@@ -57,7 +57,7 @@ unclean_stabilizing_ids = group_info[
     (group_info['state'] == 'Stabilizing') &
     ((group_info['max_voltage'] >= 22) | (group_info['min_voltage'] < 2.2))
 ].index
-all_unclean_ids = unclean_steady_ids.union(unclean_stabilizing_ids).tolist()
+all_unclean_ids = unclean_steady_ids.union(unclean_stabilizing_ids)
 
 # --- 4. Correct ALL Misclassified Data ---
 def classify_voltage(voltage):
@@ -65,20 +65,27 @@ def classify_voltage(voltage):
         return 'De-energized'
     elif 2.2 <= voltage < 22:
         return 'Stabilizing'
-    else:
+    else: # voltage >= 22
         return 'Steady State'
 
-df_cleaned['Cleaned_Status'] = df_cleaned.map_partitions(
+# We set the index to our unique group identifier to perform the correction
+df_to_fix = df_cleaned.set_index(grouping_for_agg)
+
+# The correction logic is now simpler and more direct
+df_to_fix['Cleaned_Status'] = df_to_fix.map_partitions(
     lambda pdf: pdf['dc1_status'].where(
-        ~pdf['unique_block_id'].isin(all_unclean_ids),
+        ~pdf.index.isin(all_unclean_ids), # Check the index against the list of bad groups
         pdf['voltage_28v_dc1_cal'].apply(classify_voltage)
     ),
     meta=('Cleaned_Status', 'str')
 )
 
+# Reset the index to get the columns back
+df_final_tasks = df_to_fix.reset_index()
+
 # --- 5. Get the Final Result ---
 print("Starting computation... this may take a while.")
-final_df = df_cleaned.compute()
+final_df = df_final_tasks.compute()
 print("Computation finished.")
 
 # --- 6. Summarize Changes (on the final pandas DataFrame) ---
