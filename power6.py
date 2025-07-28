@@ -50,40 +50,46 @@ parquet_writer = None
 # Define columns that MUST be numeric
 numeric_cols = ['voltage_28v_dc1_cal', 'current_28v_dc1_cal', 'timestamp'] # Add any other known numeric cols
 
-# --- 3. Read Files, Sanitize Types, and Gather Groups ---
+print("Step 1: Scanning all source files to build a master schema...")
+all_fields = {}
+for file_path in file_list:
+    schema = pq.ParquetFile(file_path).schema_arrow
+    for field in schema:
+        if field.name not in all_fields:
+            all_fields[field.name] = field
+master_schema = pa.schema([field for name, field in sorted(all_fields.items())])
+print("Master schema created successfully.")
+
+
+# --- 3. Read Files, Sanitize, Harmonize, and Gather Groups ---
 groups_data = defaultdict(list)
-print("Step 1: Reading files, sanitizing types, and gathering groups...")
+print("\nStep 2: Reading files and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
-        chunk = batch.to_pandas()
+        # Cast to the master schema first to add missing columns
+        harmonized_batch = batch.cast(master_schema)
+        chunk = harmonized_batch.to_pandas()
         
-        # --- NEW DATA SANITIZATION STEP ---
-        # Proactively fix data types for every chunk as it's read.
-        for col in chunk.columns:
-            if col in numeric_cols:
-                # Force known numeric columns to be numeric
+        # Sanitize numeric types to fix mixed-type issues
+        for col in numeric_cols:
+            if col in chunk.columns:
                 chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
-            elif col not in group_cols:
-                # Force all other non-grouping columns to be strings to prevent conversion errors
-                chunk[col] = chunk[col].astype(str)
-        
+
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
 
-print(f"\nStep 2: Cleaning each group and writing to '{output_filename}'...")
+print(f"\nStep 3: Cleaning each group and writing to '{output_filename}'...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
     full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
     cleaned_group_df = clean_one_group(full_group_df)
     
-    table = pd.Table.from_pandas(cleaned_group_df, preserve_index=False)
+    table = pa.Table.from_pandas(cleaned_group_df, schema=master_schema, preserve_index=False)
     
     if parquet_writer is None:
-        master_schema = table.schema
         parquet_writer = pq.ParquetWriter(output_filename, master_schema)
     
-    table = table.cast(master_schema)
     parquet_writer.write_table(table)
 
 if parquet_writer:
