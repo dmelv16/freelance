@@ -47,62 +47,46 @@ group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Air
 output_filename = 'final_cleaned_data.parquet'
 parquet_writer = None
 
-print("Step 1: Scanning all source files to create a master schema...")
-# Get the schema from the first file to use as a base
-base_schema = pq.ParquetFile(file_list[0]).schema_arrow
-# Create a dictionary of all fields in the base schema
-schema_fields = {field.name: field for field in base_schema}
+# Define columns that MUST be numeric
+numeric_cols = ['voltage_28v_dc1_cal', 'current_28v_dc1_cal', 'timestamp'] # Add any other known numeric cols
 
-# Loop through the rest of the files to find any additional columns
-for file_path in file_list[1:]:
-    additional_schema = pq.ParquetFile(file_path).schema_arrow
-    for field in additional_schema:
-        if field.name not in schema_fields:
-            print(f"  -> Found new column '{field.name}' in {file_path}")
-            schema_fields[field.name] = field
-
-# The final master schema has a consistent order
-master_schema = pa.schema(list(schema_fields.values()))
-print("Master schema created successfully.")
-
-
-# --- 3. Read Files in Chunks and Gather Groups ---
+# --- 3. Read Files, Sanitize Types, and Gather Groups ---
 groups_data = defaultdict(list)
-print("\nStep 2: Reading files in chunks and gathering groups...")
+print("Step 1: Reading files, sanitizing types, and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
         chunk = batch.to_pandas()
+        
+        # --- NEW DATA SANITIZATION STEP ---
+        # Proactively fix data types for every chunk as it's read.
+        for col in chunk.columns:
+            if col in numeric_cols:
+                # Force known numeric columns to be numeric
+                chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
+            elif col not in group_cols:
+                # Force all other non-grouping columns to be strings to prevent conversion errors
+                chunk[col] = chunk[col].astype(str)
+        
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
 
-print(f"\nStep 3: Cleaning each group and writing to '{output_filename}'...")
+print(f"\nStep 2: Cleaning each group and writing to '{output_filename}'...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
-    # Combine chunks for one full group
     full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
-    
-    # Run the cleaning function
     cleaned_group_df = clean_one_group(full_group_df)
     
-    # Add any missing columns from the master schema before creating the table
-    for field in master_schema:
-        if field.name not in cleaned_group_df.columns:
-            cleaned_group_df[field.name] = None # Add missing column with nulls
+    table = pd.Table.from_pandas(cleaned_group_df, preserve_index=False)
     
-    # Convert to pyarrow Table, enforcing the master schema
-    table = pa.Table.from_pandas(cleaned_group_df, schema=master_schema, preserve_index=False)
-    
-    # If this is the first group, create the Parquet file and writer
     if parquet_writer is None:
+        master_schema = table.schema
         parquet_writer = pq.ParquetWriter(output_filename, master_schema)
     
-    # The 'cast' is no longer needed as 'from_pandas' with a schema handles it
+    table = table.cast(master_schema)
     parquet_writer.write_table(table)
 
-# Close the file writer after the loop is finished
 if parquet_writer:
     parquet_writer.close()
 
 print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
-
