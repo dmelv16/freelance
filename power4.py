@@ -109,3 +109,24 @@ voltage_summary = analysis_df.groupby('dc1_status')['voltage_28v_dc1_cal'].agg([
 
 print("Voltage Summary for Key States:")
 print(voltage_summary)
+
+# --- 7. Check for Sandwiched Stabilizing Points ---
+print("\n--- Sandwiched Point Analysis ---")
+
+# This function checks for the specific pattern within a series of statuses
+def find_sandwiched(status_series):
+    is_stabilizing = status_series == 'Stabilizing'
+    prev_is_steady = status_series.shift(1) == 'Steady State'
+    next_is_steady = status_series.shift(-1) == 'Steady State'
+    return is_stabilizing & prev_is_steady & next_is_steady
+
+# We run the check on each group separately to ensure accuracy
+sandwiched_mask = final_output.groupby(group_cols)['dc1_status'].transform(find_sandwiched)
+sandwiched_count = sandwiched_mask.sum()
+
+print(f"Found {sandwiched_count} 'Stabilizing' point(s) sandwiched between 'Steady State' points.")
+
+# If any are found, print them for review
+if sandwiched_count > 0:
+    print("\nRows with sandwiched 'Stabilizing' points:")
+    print(final_output[sandwiched_mask])
