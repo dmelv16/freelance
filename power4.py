@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import pyarrow.parquet as pq # Import the pyarrow library
 from collections import defaultdict
 from tqdm import tqdm # A helpful library for progress bars: pip install tqdm
 
@@ -43,13 +44,15 @@ def clean_one_group(group_df):
 file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
 group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft'] 
 
-# A dictionary to hold the pieces of each group
 groups_data = defaultdict(list)
 
 print("Step 1: Reading files in chunks and gathering groups...")
 # This loop reads each file chunk by chunk without loading the whole file
 for file_path in file_list:
-    for chunk in pd.read_parquet(file_path, engine='pyarrow', chunk_size=500_000):
+    # THIS IS THE CORRECTED LOOP
+    parquet_file = pq.ParquetFile(file_path)
+    for batch in parquet_file.iter_batches(batch_size=500_000):
+        chunk = batch.to_pandas()
         # Group the chunk and append each small group piece to our dictionary
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
