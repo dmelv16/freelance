@@ -4,48 +4,46 @@ import pyarrow.parquet as pq
 from collections import defaultdict
 from tqdm import tqdm
 
-# --- 1. Define a Function to Clean a SINGLE Group with Dynamic Thresholding ---
-# This function now applies its logic to every group it receives.
+# --- 1. Define a Function to Clean a SINGLE Group with State-Locking ---
 def clean_one_group(group_df):
     
-    # You can easily adjust this tolerance. 0.02 means the voltage must be
-    # within 2% of the group's mean to be considered 'Steady State'.
+    # You can easily adjust this tolerance.
     TOLERANCE_PERCENT = 0.02
 
     # --- First Pass: Calculate the dynamic threshold for THIS group ---
-    
-    # Find all points initially considered steady state to calculate a target voltage
     initial_steady_points = group_df[group_df['voltage_28v_dc1_cal'] >= 22]
-    
-    # Default to the fixed 22V if there are no steady points to analyze
     dynamic_threshold = 22.0 
     
     if not initial_steady_points.empty:
-        # Calculate the group's specific mean operating voltage
         group_mean_voltage = initial_steady_points['voltage_28v_dc1_cal'].mean()
-        # Calculate the new threshold based on the tolerance
         dynamic_threshold = group_mean_voltage * (1 - TOLERANCE_PERCENT)
 
-    # --- Second Pass: Classify ALL data in the group using the new threshold ---
-    
-    def classify_voltage_dynamic(voltage):
-        if voltage < 2.2:
-            return 'De-energized'
-        # A point is only 'Steady State' if it's above our new dynamic threshold
-        elif voltage >= dynamic_threshold:
-            return 'Steady State'
-        # Otherwise, if it's above 2.2V but below the dynamic threshold, it's stabilizing.
-        elif voltage >= 2.2:
-            return 'Stabilizing'
-        else:
-            return 'De-energized'
-            
+    # --- Second Pass: Classify data using state-locking logic ---
     group_df = group_df.copy()
     
-    # Apply the new classification to the entire group to create the 'Cleaned_Status' column
-    group_df['Cleaned_Status'] = group_df['voltage_28v_dc1_cal'].apply(classify_voltage_dynamic)
-    
-    # The old 'unclean block' detection logic has been removed.
+    # We will build the cleaned status list point-by-point
+    cleaned_statuses = []
+    steady_state_achieved = False # The "lock" flag for this group
+
+    for voltage in group_df['voltage_28v_dc1_cal']:
+        current_status = ''
+        if voltage < 2.2:
+            current_status = 'De-energized'
+            steady_state_achieved = False # Reset the lock if de-energized
+        elif voltage >= dynamic_threshold:
+            current_status = 'Steady State'
+            steady_state_achieved = True # Set the lock
+        else: # Voltage is between 2.2V and the dynamic threshold
+            if steady_state_achieved:
+                # If we've already hit steady state, a minor dip is not a new "stabilizing" phase.
+                current_status = 'Steady State' 
+            else:
+                # If we haven't hit steady state yet, this is part of the ramp-up.
+                current_status = 'Stabilizing'
+        
+        cleaned_statuses.append(current_status)
+        
+    group_df['Cleaned_Status'] = cleaned_statuses
     
     return group_df
 
