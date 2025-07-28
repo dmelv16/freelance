@@ -92,3 +92,20 @@ else:
     print(change_counts.to_string(index=False))
     print(f"\nTotal classifications changed: {len(changed_rows)}")
 print("="*35)
+
+# Overwrite original column and drop the temp one
+final_df['dc1_status'] = final_df['Cleaned_Status']
+final_output = final_df.drop(columns=['Cleaned_Status', 'block_id'])
+
+
+# --- 6. Final Voltage Analysis ---
+print("\n--- Final Analysis of Cleaned Data ---")
+
+# Filter for the statuses we want to verify
+analysis_df = final_output[final_output['dc1_status'].isin(['Stabilizing', 'Steady State'])]
+
+# Group by the cleaned status and get the min and max voltage for each
+voltage_summary = analysis_df.groupby('dc1_status')['voltage_28v_dc1_cal'].agg(['min', 'max'])
+
+print("Voltage Summary for Key States:")
+print(voltage_summary)
