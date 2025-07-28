@@ -45,54 +45,15 @@ def clean_one_group(group_df):
 file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
 group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft'] 
 groups_data = defaultdict(list)
-
-print("Step 1: Reading files in chunks and gathering groups...")
-for file_path in file_list:
-    parquet_file = pq.ParquetFile(file_path)
-    # Get all column names from the file schema
-    all_columns = parquet_file.schema.names
-    for batch in parquet_file.iter_batches(batch_size=500_000, columns=all_columns):
-        chunk = batch.to_pandas()
-        for group_key, group_df in chunk.groupby(group_cols):
-            groups_data[group_key].append(group_df)
-print(f"Finished gathering data for {len(groups_data)} unique groups.")
-
-# --- 3. Process Each Group and Write Directly to a New Parquet File ---
-cleaned_dfs_for_analysis = [] # We still collect for final summary, but not for saving
 output_filename = 'final_cleaned_data.parquet'
 parquet_writer = None
+master_schema = None
 
-# --- THIS IS THE NEW LOGIC TO CREATE A UNIVERSAL SCHEMA ---
-print("Scanning all files to create a universal master schema...")
-all_columns = set()
-for file_path in file_list:
-    schema = pq.ParquetFile(file_path).schema_arrow
-    for col_name in schema.names:
-        all_columns.add(col_name)
-
-# We can rebuild a master schema from a reference file and add missing fields
-# For simplicity, we will ensure columns are present in each chunk later.
-source_file = pq.ParquetFile(file_list[0])
-master_schema = source_file.schema_arrow
-master_columns = master_schema.names
-# Find any columns that are not in our master file's schema
-additional_columns = all_columns - set(master_columns)
-# Note: This script assumes additional columns can be safely added.
-# For a fully robust solution, you would merge schemas. Here we handle it at the chunk level.
-universal_column_list = master_columns + list(additional_columns)
-
-
-groups_data = defaultdict(list)
 print("Step 1: Reading files in chunks and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
         chunk = batch.to_pandas()
-        # --- NEW: Ensure chunk has all universal columns ---
-        for col in universal_column_list:
-            if col not in chunk.columns:
-                chunk[col] = None # Add missing columns with a null value
-        
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
@@ -105,23 +66,17 @@ for group_key, list_of_chunks in tqdm(groups_data.items()):
     # Run the cleaning function
     cleaned_group_df = clean_one_group(full_group_df)
     
-    # Ensure the cleaned group has all columns before creating the table
-    for col in universal_column_list:
-        if col not in cleaned_group_df.columns:
-            cleaned_group_df[col] = None
-    
     # Convert to pyarrow Table
     table = pa.Table.from_pandas(cleaned_group_df, preserve_index=False)
     
     # If this is the first group, create the Parquet file and writer
     if parquet_writer is None:
-        # Use the schema from the first processed table as the definitive master schema
+        # The schema of the VERY FIRST processed group becomes the master schema
         master_schema = table.schema
         parquet_writer = pq.ParquetWriter(output_filename, master_schema)
     
-    # Ensure the table schema matches the master before writing
-    if not table.schema.equals(master_schema):
-        table = table.cast(master_schema)
+    # Force the current table to match the master schema (reorders columns, casts types)
+    table = table.cast(master_schema)
         
     parquet_writer.write_table(table)
 
@@ -130,4 +85,5 @@ if parquet_writer:
     parquet_writer.close()
 
 print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
+
 
