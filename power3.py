@@ -35,65 +35,71 @@ values_to_remove = ['Error 0 volt', 'Error missing volt', 'Normal transient', 'A
 df_cleaned = df[~df['dc1_trans'].isin(values_to_remove)]
 
 # --- 3. Identify Misclassified Groups ---
+# This part remains the same. It finds the blocks that need fixing.
 df_cleaned['block_id'] = df_cleaned.groupby(group_cols)['dc1_status'].transform(
     lambda x: (x != x.shift()).fillna(True).astype(int).cumsum(),
     meta=('block_id', 'int64')
 )
 block_identifier_cols = group_cols + ['block_id']
 
-# Perform the small aggregation to find which blocks are unclean
 group_info = df_cleaned.groupby(block_identifier_cols).agg(
     min_voltage=('voltage_28v_dc1_cal', 'min'),
     max_voltage=('voltage_28v_dc1_cal', 'max'),
     state=('dc1_status', 'first')
 ).compute()
 
-# Determine which groups are unclean
 is_unclean_steady = (group_info['state'] == 'Steady State') & (group_info['min_voltage'] < 22)
 is_unclean_stabilizing = (group_info['state'] == 'Stabilizing') & ((group_info['max_voltage'] >= 22) | (group_info['min_voltage'] < 2.2))
-group_info['is_unclean'] = is_unclean_steady | is_unclean_stabilizing
+unclean_block_index = group_info[is_unclean_steady | is_unclean_stabilizing].index
+# Convert the pandas MultiIndex to a set for very fast lookups
+unclean_block_set = set(unclean_block_index)
 
-# Get just the identifiers of the unclean blocks
-unclean_block_identifiers = group_info[group_info['is_unclean']].reset_index()[block_identifier_cols]
 
-# --- 4. Isolate Unclean Rows and Compute Corrections ---
-# Merge to get a Dask DataFrame containing ONLY the rows that need to be fixed
-rows_to_fix = dd.merge(
-    df_cleaned,
-    unclean_block_identifiers,
-    on=block_identifier_cols,
-    how='inner' # 'inner' join gives us only the matching (unclean) rows
+# --- 4. Define the Correction Function for a Single Partition ---
+# This function will run on each chunk of our data.
+def correct_partition(partition, block_identifiers, unclean_ids):
+    
+    # Define the classification logic
+    def classify_voltage(voltage):
+        if voltage < 2.2:
+            return 'De-energized'
+        elif 2.2 <= voltage < 22:
+            return 'Stabilizing'
+        else: # voltage >= 22
+            return 'Steady State'
+            
+    # Create the multi-index for the rows in this partition
+    partition_multi_index = pd.MultiIndex.from_frame(partition[block_identifiers])
+    
+    # Find which rows in this partition are part of an unclean block
+    is_unclean_mask = partition_multi_index.isin(unclean_ids)
+    
+    # Start with the original status
+    partition['Cleaned_Status'] = partition['dc1_status']
+    
+    # If there's anything to fix in this partition, apply the correction
+    if is_unclean_mask.any():
+        # Get the voltages of only the unclean rows
+        voltages_to_fix = partition.loc[is_unclean_mask, 'voltage_28v_dc1_cal']
+        # Apply the function to only those voltages
+        corrections = voltages_to_fix.apply(classify_voltage)
+        # Place the corrections into the correct rows
+        partition.loc[is_unclean_mask, 'Cleaned_Status'] = corrections
+        
+    return partition
+
+# --- 5. Apply the Correction across all Partitions ---
+# We use map_partitions to run our function on every chunk.
+# We must provide the 'meta' to tell Dask what the output looks like.
+meta_df = df_cleaned._meta.copy()
+meta_df['Cleaned_Status'] = pd.Series(dtype='str')
+
+df_with_fixes = df_cleaned.map_partitions(
+    correct_partition,
+    block_identifier_cols,
+    unclean_block_set,
+    meta=meta_df
 )
-
-# Now, compute this much smaller DataFrame of unclean rows. This should easily fit in memory.
-unclean_rows_pd = rows_to_fix.compute()
-
-# Define the classification function
-def classify_voltage(voltage):
-    if voltage < 2.2:
-        return 'De-energized'
-    elif 2.2 <= voltage < 22:
-        return 'Stabilizing'
-    else:
-        return 'Steady State'
-
-# On this smaller pandas DataFrame, calculate the correct status
-unclean_rows_pd['Correction'] = unclean_rows_pd['voltage_28v_dc1_cal'].apply(classify_voltage)
-
-# Create our final "fix-it" table. It only needs the original index to match rows, and the correction.
-# We use the original DataFrame's index for a direct mapping.
-fix_it_table = unclean_rows_pd[['Correction']].set_index(unclean_rows_pd.index)
-
-
-# --- 5. Apply Corrections via Merge ---
-# Merge the "fix-it" table back to the original Dask DataFrame.
-# This joins the 'Correction' column to the rows that need it.
-df_with_fixes = df_cleaned.merge(fix_it_table, how='left', left_index=True, right_index=True)
-
-# Create the final 'Cleaned_Status' column.
-# If a 'Correction' exists for a row, use it. Otherwise, use the original status.
-df_with_fixes['Cleaned_Status'] = df_with_fixes['Correction'].fillna(df_with_fixes['dc1_status'])
-
 
 # --- 6. Get the Final Result ---
 print("Starting computation... this may take a while.")
