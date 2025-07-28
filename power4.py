@@ -3,6 +3,7 @@ import numpy as np
 import pyarrow.parquet as pq # Import the pyarrow library
 from collections import defaultdict
 from tqdm import tqdm # A helpful library for progress bars: pip install tqdm
+import matplotlib.pyplot as plt
 
 # --- 1. Define a Function to Clean a SINGLE Group ---
 # This function remains exactly the same.
@@ -112,3 +113,51 @@ after_summary = perform_detailed_analysis(
 print("\n--- Analysis Complete ---")
 print("\n'before_cleaning_summary.csv' contains stats on original data.")
 print("'after_cleaning_summary.csv' contains stats on cleaned data.")
+
+
+# --- 5. Finalize the DataFrame ---
+# We now have 'dc1_status' (original) and 'Cleaned_Status'
+final_df.drop(columns=['block_id'], inplace=True, errors='ignore')
+
+
+# --- 6. Create Overlay Visualization ---
+print("\n--- Generating Overlay Visualization ---")
+
+# Use the cleaned status for our analysis
+final_df['status_for_plot'] = final_df['Cleaned_Status']
+
+# Step A: Find the start time for each group (first 'Stabilizing' timestamp)
+print("Step A: Finding start time for each group...")
+stabilizing_starts = final_df[final_df['status_for_plot'] == 'Stabilizing'].groupby(group_cols)['timestamp'].min().to_frame('start_time').reset_index()
+
+# Step B: Merge start times back to the main DataFrame
+plot_df = pd.merge(final_df, stabilizing_starts, on=group_cols, how='inner')
+
+# Step C: Calculate normalized time relative to the start of the ramp
+plot_df['normalized_time'] = plot_df['timestamp'] - plot_df['start_time']
+
+# Step D: Filter for just the data we want to plot
+plot_df = plot_df[plot_df['status_for_plot'].isin(['Stabilizing', 'Steady State'])]
+
+# Step E: Create the plot
+print("Step B: Generating plot...")
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, ax = plt.subplots(figsize=(15, 8))
+
+# Loop through each group and plot its voltage profile
+for name, group in plot_df.groupby(group_cols):
+    ax.plot(group['normalized_time'], group['voltage_28v_dc1_cal'], alpha=0.4, linewidth=1.5)
+
+# Add reference lines for clarity
+ax.axhline(2.2, color='orange', linestyle='--', label='Stabilizing Threshold (2.2V)')
+ax.axhline(22, color='green', linestyle='--', label='Steady State Threshold (22V)')
+
+ax.set_title('Overlayed Voltage Ramp-Up Profiles for All Test Groups', fontsize=16, weight='bold')
+ax.set_xlabel('Normalized Time (from start of Stabilizing phase)', fontsize=12)
+ax.set_ylabel('Voltage (voltage_28v_dc1_cal)', fontsize=12)
+ax.legend()
+ax.grid(True)
+
+# Save the figure to a file
+plt.savefig('voltage_ramp_overlay.png', dpi=300)
+print("\nVisualization complete. Plot saved to 'voltage_ramp_overlay.png'")
