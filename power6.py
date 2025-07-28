@@ -9,10 +9,10 @@ from tqdm import tqdm
 def clean_one_group(group_df):
     
     TOLERANCE_PERCENT = 0.02
-    group_df = group_df.copy()
+    df = group_df.copy() # Use a new variable name to avoid confusion
 
-    # First Pass: Calculate dynamic threshold and make initial classification
-    initial_steady_points = group_df[group_df['voltage_28v_dc1_cal'] >= 22]
+    # --- First Pass: Calculate dynamic threshold ---
+    initial_steady_points = df[df['voltage_28v_dc1_cal'] >= 22]
     dynamic_threshold = 22.0 
     
     if not initial_steady_points.empty:
@@ -20,32 +20,26 @@ def clean_one_group(group_df):
         dynamic_threshold = group_mean_voltage * (1 - TOLERANCE_PERCENT)
 
     def initial_classify(voltage):
-        if voltage < 2.2:
-            return 'De-energized'
-        elif voltage >= dynamic_threshold:
-            return 'Steady State'
-        else:
-            return 'Stabilizing'
+        if voltage < 2.2: return 'De-energized'
+        elif voltage >= dynamic_threshold: return 'Steady State'
+        else: return 'Stabilizing'
             
-    group_df['Cleaned_Status'] = group_df['voltage_28v_dc1_cal'].apply(initial_classify)
+    df['Cleaned_Status'] = df['voltage_28v_dc1_cal'].apply(initial_classify)
 
-    # Second Pass: Differentiate ramp-up, ramp-down, and dips
-    steady_indices = group_df.index[group_df['Cleaned_Status'] == 'Steady State']
+    # --- Second Pass: Differentiate ramp-up, ramp-down, and dips ---
+    steady_indices = df.index[df['Cleaned_Status'] == 'Steady State']
     
     if not steady_indices.empty:
-        first_steady_index = steady_indices[0]
-        last_steady_index = steady_indices[-1]
+        first_steady_index, last_steady_index = steady_indices[0], steady_indices[-1]
+        is_stabilizing = df['Cleaned_Status'] == 'Stabilizing'
+        is_between = (df.index > first_steady_index) & (df.index < last_steady_index)
+        df.loc[is_stabilizing & is_between, 'Cleaned_Status'] = 'Steady State'
 
-        is_stabilizing = group_df['Cleaned_Status'] == 'Stabilizing'
-        is_between = (group_df.index > first_steady_index) & (group_df.index < last_steady_index)
-        
-        group_df.loc[is_stabilizing & is_between, 'Cleaned_Status'] = 'Steady State'
-
-    # Overwrite the original status column for the final output
-    group_df['dc1_status'] = group_df['Cleaned_Status']
+    # Overwrite the original status column with the cleaned values
+    df['dc1_status'] = df['Cleaned_Status']
     
-    # Return the dataframe with all original columns, plus the updated status
-    return group_df.drop(columns=['Cleaned_Status'], errors='ignore')
+    # Return a DataFrame with the exact same columns as the original input
+    return df[original_columns]
 
 # --- 2. Read Files in Chunks and Gather Groups ---
 file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
