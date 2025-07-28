@@ -126,38 +126,42 @@ print("\n--- Generating Overlay Visualization ---")
 # Use the cleaned status for our analysis
 final_df['status_for_plot'] = final_df['Cleaned_Status']
 
-# Step A: Find the start time for each group (first 'Stabilizing' timestamp)
-print("Step A: Finding start time for each group...")
-stabilizing_starts = final_df[final_df['status_for_plot'] == 'Stabilizing'].groupby(group_cols)['timestamp'].min().to_frame('start_time').reset_index()
+# Step A: Find the start time for each group (first 'Stabilizing' OR 'Steady State' timestamp)
+print("Step A: Finding ramp-up start time for each group...")
+# THIS IS THE CORRECTED LOGIC
+ramp_up_states = ['Stabilizing', 'Steady State']
+ramp_up_rows = final_df[final_df['status_for_plot'].isin(ramp_up_states)]
+start_times = ramp_up_rows.groupby(group_cols)['timestamp'].min().to_frame('start_time').reset_index()
 
 # Step B: Merge start times back to the main DataFrame
-plot_df = pd.merge(final_df, stabilizing_starts, on=group_cols, how='inner')
+plot_df = pd.merge(final_df, start_times, on=group_cols, how='inner')
 
-# Step C: Calculate normalized time relative to the start of the ramp
+# Step C: Calculate normalized time 
 plot_df['normalized_time'] = plot_df['timestamp'] - plot_df['start_time']
 
-# Step D: Filter for just the data we want to plot
-plot_df = plot_df[plot_df['status_for_plot'].isin(['Stabilizing', 'Steady State'])]
+# Step D: We can now plot all states, including 'De-energized' before T=0
+# plot_df = plot_df[plot_df['status_for_plot'].isin(['Stabilizing', 'Steady State'])] # This filter is no longer necessary
 
 # Step E: Create the plot
 print("Step B: Generating plot...")
-plt.style.use('seaborn-v0_8-whitegrid')
 fig, ax = plt.subplots(figsize=(15, 8))
 
-# Loop through each group and plot its voltage profile
+# Loop through each group and plot its voltage points
 for name, group in plot_df.groupby(group_cols):
-    ax.plot(group['normalized_time'], group['voltage_28v_dc1_cal'], alpha=0.4, linewidth=1.5)
+    ax.scatter(group['normalized_time'], group['voltage_28v_dc1_cal'], alpha=0.5, s=10)
 
 # Add reference lines for clarity
 ax.axhline(2.2, color='orange', linestyle='--', label='Stabilizing Threshold (2.2V)')
 ax.axhline(22, color='green', linestyle='--', label='Steady State Threshold (22V)')
+ax.axvline(0, color='gray', linestyle=':', label='T=0 (Start of Ramp-Up)')
 
-ax.set_title('Overlayed Voltage Ramp-Up Profiles for All Test Groups', fontsize=16, weight='bold')
-ax.set_xlabel('Normalized Time (from start of Stabilizing phase)', fontsize=12)
+
+ax.set_title('Overlayed Voltage Ramp-Up Profiles for All Test Groups', fontsize=16)
+ax.set_xlabel('Normalized Time (from start of ramp-up)', fontsize=12)
 ax.set_ylabel('Voltage (voltage_28v_dc1_cal)', fontsize=12)
 ax.legend()
 ax.grid(True)
 
 # Save the figure to a file
-plt.savefig('voltage_ramp_overlay.png', dpi=300)
-print("\nVisualization complete. Plot saved to 'voltage_ramp_overlay.png'")
+plt.savefig('voltage_ramp_overlay_scatter.png', dpi=300)
+print("\nVisualization complete. Plot saved to 'voltage_ramp_overlay_scatter.png'")
