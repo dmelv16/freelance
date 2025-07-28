@@ -1,9 +1,10 @@
-import dask.dataframe as dd
 import pandas as pd
 import numpy as np
+from tqdm import tqdm # A helpful library for progress bars: pip install tqdm
 
 # --- 1. Define a Function to Clean a SINGLE Group ---
-# This function still needs to create Cleaned_Status temporarily for the summary.
+# This is the same function from our last attempt. It contains all the
+# pandas logic to clean one complete group of data.
 def clean_one_group(group_df):
     
     def classify_voltage(voltage):
@@ -11,7 +12,7 @@ def clean_one_group(group_df):
             return 'De-energized'
         elif 2.2 <= voltage < 22:
             return 'Stabilizing'
-        else:
+        else: # voltage >= 22
             return 'Steady State'
             
     group_df = group_df.copy()
@@ -37,37 +38,48 @@ def clean_one_group(group_df):
         corrections = voltages_to_fix.apply(classify_voltage)
         group_df.loc[is_unclean_mask, 'Cleaned_Status'] = corrections
     
-    # Return the necessary columns for the next steps
-    return group_df[['timestamp', 'voltage_28v_dc1_cal', 'dc1_status', 'Cleaned_Status']]
+    return group_df
 
-# --- 2. Read Data and Define Grouping ---
+# --- 2. Get All Unique Groups from Parquet Files (Low Memory) ---
 file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
-df = dd.read_parquet(file_list)
-
 group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft'] 
-values_to_remove = ['Error 0 volt', 'Error missing volt', 'Normal transient', 'Abnormal transient']
-df_cleaned = df[~df['dc1_trans'].isin(values_to_remove)]
 
-# --- 3. Apply the Cleaning Function and Compute ---
-meta = {
-    'timestamp': 'float64', 
-    'voltage_28v_dc1_cal': 'float64', 
-    'dc1_status': 'object', 
-    'Cleaned_Status': 'object'
-}
+print("Step 1: Scanning files to find all unique groups...")
+# Read ONLY the grouping columns from the files to find unique groups
+all_groups_df = pd.concat(
+    [pd.read_parquet(f, columns=group_cols) for f in file_list]
+).drop_duplicates()
+print(f"Found {len(all_groups_df)} unique groups to process.")
 
-print("Starting computation...")
-final_df = df_cleaned.groupby(group_cols).apply(clean_one_group, meta=meta).compute()
-print("Computation finished.")
+# --- 3. Loop, Read, Clean, and Collect ---
+cleaned_dfs = [] # We'll store cleaned group DataFrames here
 
-# --- 4. Summarize Changes ---
+# Using tqdm for a progress bar
+for index, group_key in tqdm(all_groups_df.iterrows(), total=len(all_groups_df)):
+    # Create a filter expression for pyarrow
+    # e.g., [('unit_id', '=', 'A'), ('test_run', '=', 1)]
+    filters = [(col, '=', value) for col, value in group_key.items()]
+    
+    # Read only the data for this specific group from all files
+    group_data = pd.concat(
+        [pd.read_parquet(f, filters=filters) for f in file_list]
+    )
+    
+    # Run our cleaning function on this small, in-memory DataFrame
+    cleaned_group = clean_one_group(group_data)
+    cleaned_dfs.append(cleaned_group)
+
+# --- 4. Combine All Cleaned Groups ---
+print("\nStep 3: Combining all cleaned groups...")
+final_df = pd.concat(cleaned_dfs, ignore_index=True)
+print("Processing complete.")
+
+# --- 5. Summarize Changes ---
 print("\n" + "="*35)
 print("        Cleaning Summary")
 print("="*35)
-
-final_df_reset = final_df.reset_index()
-changes_mask = final_df_reset['dc1_status'] != final_df_reset['Cleaned_Status']
-changed_rows = final_df_reset[changes_mask]
+changes_mask = final_df['dc1_status'] != final_df['Cleaned_Status']
+changed_rows = final_df[changes_mask]
 
 if changed_rows.empty:
     print("No classifications were changed.")
@@ -78,12 +90,3 @@ else:
     print(change_counts.to_string(index=False))
     print(f"\nTotal classifications changed: {len(changed_rows)}")
 print("="*35)
-
-# --- 5. Finalize DataFrame Shape ---
-# This new step overwrites the original column and drops the temporary one.
-print("\nUpdating original columns and finalizing shape...")
-final_df_reset['dc1_status'] = final_df_reset['Cleaned_Status']
-final_output = final_df_reset.drop(columns=['Cleaned_Status'])
-
-print("Final DataFrame shape matches original data.")
-print(final_output.head())
