@@ -68,21 +68,34 @@ cleaned_dfs_for_analysis = [] # We still collect for final summary, but not for 
 output_filename = 'final_cleaned_data.parquet'
 parquet_writer = None
 
+# Get the schema from the first source file to use as our master template
+source_file = pq.ParquetFile(file_list[0])
+master_schema = source_file.schema
+original_columns = master_schema.names # Get the original column order
+
+print("Step 1: Reading files in chunks and gathering groups...")
+for file_path in file_list:
+    parquet_file = pq.ParquetFile(file_path)
+    for batch in parquet_file.iter_batches(batch_size=500_000, columns=original_columns):
+        chunk = batch.to_pandas()
+        for group_key, group_df in chunk.groupby(group_cols):
+            groups_data[group_key].append(group_df)
+print(f"Finished gathering data for {len(groups_data)} unique groups.")
+
 print(f"\nStep 2: Cleaning each group and writing to '{output_filename}'...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
     # Combine chunks for one full group
     full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
     
     # Run the cleaning function
-    cleaned_group = clean_one_group(full_group_df)
+    cleaned_group_df = clean_one_group(full_group_df, original_columns)
     
-    # We are done with this group, now write it to the file
-    # Convert the pandas DataFrame to a pyarrow Table
-    table = pa.Table.from_pandas(cleaned_group)
+    # Convert the cleaned pandas DataFrame to a pyarrow Table, ENFORCING the master schema
+    table = pa.Table.from_pandas(cleaned_group_df, schema=master_schema)
     
-    # If this is the first group, create the Parquet file and writer
+    # If this is the first group, create the Parquet file and writer with the master schema
     if parquet_writer is None:
-        parquet_writer = pq.ParquetWriter(output_filename, table.schema)
+        parquet_writer = pq.ParquetWriter(output_filename, master_schema)
     
     # Write the cleaned group's data to the file
     parquet_writer.write_table(table)
@@ -91,4 +104,4 @@ for group_key, list_of_chunks in tqdm(groups_data.items()):
 if parquet_writer:
     parquet_writer.close()
 
-print(f"\nProcessing complete. All original data with cleaned states has been saved to '{output_filename}'.")
+print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
