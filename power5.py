@@ -4,13 +4,13 @@ import pyarrow.parquet as pq
 from collections import defaultdict
 from tqdm import tqdm
 
-# --- 1. Define a Function to Clean a SINGLE Group with State-Locking ---
+# --- 1. Define the Final Cleaning Function ---
 def clean_one_group(group_df):
     
-    # You can easily adjust this tolerance.
     TOLERANCE_PERCENT = 0.02
+    group_df = group_df.copy()
 
-    # --- First Pass: Calculate the dynamic threshold for THIS group ---
+    # --- First Pass: Calculate dynamic threshold and make initial classification ---
     initial_steady_points = group_df[group_df['voltage_28v_dc1_cal'] >= 22]
     dynamic_threshold = 22.0 
     
@@ -18,35 +18,33 @@ def clean_one_group(group_df):
         group_mean_voltage = initial_steady_points['voltage_28v_dc1_cal'].mean()
         dynamic_threshold = group_mean_voltage * (1 - TOLERANCE_PERCENT)
 
-    # --- Second Pass: Classify data using state-locking logic ---
-    group_df = group_df.copy()
-    
-    # We will build the cleaned status list point-by-point
-    cleaned_statuses = []
-    steady_state_achieved = False # The "lock" flag for this group
-
-    for voltage in group_df['voltage_28v_dc1_cal']:
-        current_status = ''
+    # Make an initial classification based purely on voltage thresholds
+    def initial_classify(voltage):
         if voltage < 2.2:
-            current_status = 'De-energized'
-            steady_state_achieved = False # Reset the lock if de-energized
+            return 'De-energized'
         elif voltage >= dynamic_threshold:
-            current_status = 'Steady State'
-            steady_state_achieved = True # Set the lock
-        else: # Voltage is between 2.2V and the dynamic threshold
-            if steady_state_achieved:
-                # If we've already hit steady state, a minor dip is not a new "stabilizing" phase.
-                current_status = 'Steady State' 
-            else:
-                # If we haven't hit steady state yet, this is part of the ramp-up.
-                current_status = 'Stabilizing'
-        
-        cleaned_statuses.append(current_status)
-        
-    group_df['Cleaned_Status'] = cleaned_statuses
-    
-    return group_df
+            return 'Steady State'
+        else:
+            return 'Stabilizing'
+            
+    group_df['Cleaned_Status'] = group_df['voltage_28v_dc1_cal'].apply(initial_classify)
 
+    # --- Second Pass: Differentiate ramp-up, ramp-down, and dips ---
+    # Find the index of the first and last true steady state points
+    steady_indices = group_df.index[group_df['Cleaned_Status'] == 'Steady State']
+    
+    if not steady_indices.empty:
+        first_steady_index = steady_indices[0]
+        last_steady_index = steady_indices[-1]
+
+        # Identify points that are stabilizing but are between the first and last steady state points
+        is_stabilizing = group_df['Cleaned_Status'] == 'Stabilizing'
+        is_between = (group_df.index > first_steady_index) & (group_df.index < last_steady_index)
+        
+        # Re-classify these in-between dips as 'Steady State'
+        group_df.loc[is_stabilizing & is_between, 'Cleaned_Status'] = 'Steady State'
+
+    return group_df
 # --- 2. Read Files in Chunks and Gather Groups ---
 file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
 group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft'] 
