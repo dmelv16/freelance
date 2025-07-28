@@ -61,16 +61,28 @@ master_schema = pa.schema([field for name, field in sorted(all_fields.items())])
 print("Master schema created successfully.")
 
 
-# --- 3. Read Files, Sanitize, Harmonize, and Gather Groups ---
+# --- 3. Read Files, Harmonize, Sanitize, and Gather Groups ---
 groups_data = defaultdict(list)
+# Get the list of all column names in the correct order from our master schema
+master_column_names = master_schema.names
+
 print("\nStep 2: Reading files and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
-        # Cast to the master schema first to add missing columns
-        harmonized_batch = batch.cast(master_schema)
-        chunk = harmonized_batch.to_pandas()
+        # Convert the raw batch to pandas first
+        chunk = batch.to_pandas()
         
+        # --- FIX STARTS HERE ---
+        # 1. Harmonize Schema: Add any columns from the master list that are missing in this chunk
+        for col_name in master_column_names:
+            if col_name not in chunk.columns:
+                chunk[col_name] = None # Add missing column with nulls
+        
+        # 2. Ensure the column order is exactly the same as the master schema
+        chunk = chunk[master_column_names]
+        # --- FIX ENDS HERE ---
+
         # Sanitize numeric types to fix mixed-type issues
         for col in numeric_cols:
             if col in chunk.columns:
