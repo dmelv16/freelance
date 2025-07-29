@@ -50,33 +50,44 @@ parquet_writer = None
 # Define columns that MUST be numeric
 numeric_cols = ['voltage_28v_dc1_cal', 'current_28v_dc1_cal', 'timestamp'] # Add any other known numeric cols
 
-# --- 3. Build a Corrected Master Schema ---
+# --- 3. Build a Corrected, Universal Master Schema ---
 print("Step 1: Building a corrected master schema...")
-# Get the base schema from the first file
-base_schema = pq.ParquetFile(file_list[0]).schema_arrow
+all_fields = {}
+# Read the schema from every file to find all possible columns
+for file_path in file_list:
+    schema = pq.ParquetFile(file_path).schema_arrow
+    for field in schema:
+        if field.name not in all_fields:
+            all_fields[field.name] = field
 
+# Create a new list of fields, correcting types based on your lists
 corrected_fields = []
-for field in base_schema:
-    if field.name in string_cols:
-        # If this column MUST be a string, create a new string field
-        corrected_fields.append(pa.field(field.name, pa.string()))
-    elif field.name in numeric_cols:
-        # Use float64 for numeric columns for safety and consistency
-        corrected_fields.append(pa.field(field.name, pa.float64()))
+for name, field in sorted(all_fields.items()):
+    if name in string_cols:
+        corrected_fields.append(pa.field(name, pa.string()))
+    elif name in numeric_cols:
+        corrected_fields.append(pa.field(name, pa.float64()))
     else:
-        # Keep the original field type for all other columns
         corrected_fields.append(field)
 
+# This is our "golden" schema with a consistent order and corrected types
 master_schema = pa.schema(corrected_fields)
 print("Corrected master schema created successfully.")
 
-# --- 4. Read Files and Gather Groups ---
+# --- 4. Read Files, Harmonize, and Gather Groups ---
 groups_data = defaultdict(list)
 print("\nStep 2: Reading files and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
+        # Convert to pandas, then harmonize schema and types
         chunk = batch.to_pandas()
+        
+        # Add any columns from the master schema that are missing in this chunk
+        for field in master_schema:
+            if field.name not in chunk.columns:
+                chunk[field.name] = None
+        
         for group_key, group_df in chunk.groupby(group_cols):
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
@@ -87,12 +98,8 @@ for group_key, list_of_chunks in tqdm(groups_data.items()):
         full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
         cleaned_group_df = clean_one_group(full_group_df)
         
-        # Convert to a pyarrow Table
-        table = pa.Table.from_pandas(cleaned_group_df, preserve_index=False)
-        
-        # Force the table to conform to our corrected master schema
-        # This will correctly convert your string columns to string, and numeric to float
-        table = table.cast(master_schema)
+        # Convert to a pyarrow Table, forcing it to conform to our corrected master schema
+        table = pa.Table.from_pandas(cleaned_group_df, schema=master_schema, preserve_index=False)
         
         if parquet_writer is None:
             parquet_writer = pq.ParquetWriter(output_filename, master_schema)
@@ -107,5 +114,3 @@ if parquet_writer:
     parquet_writer.close()
 
 print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
-
-
