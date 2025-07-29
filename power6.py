@@ -50,9 +50,29 @@ parquet_writer = None
 # Define columns that MUST be numeric
 numeric_cols = ['voltage_28v_dc1_cal', 'current_28v_dc1_cal', 'timestamp'] # Add any other known numeric cols
 
-# --- 3. Read Files and Gather Groups ---
+# --- 3. Build a Corrected Master Schema ---
+print("Step 1: Building a corrected master schema...")
+# Get the base schema from the first file
+base_schema = pq.ParquetFile(file_list[0]).schema_arrow
+
+corrected_fields = []
+for field in base_schema:
+    if field.name in string_cols:
+        # If this column MUST be a string, create a new string field
+        corrected_fields.append(pa.field(field.name, pa.string()))
+    elif field.name in numeric_cols:
+        # Use float64 for numeric columns for safety and consistency
+        corrected_fields.append(pa.field(field.name, pa.float64()))
+    else:
+        # Keep the original field type for all other columns
+        corrected_fields.append(field)
+
+master_schema = pa.schema(corrected_fields)
+print("Corrected master schema created successfully.")
+
+# --- 4. Read Files and Gather Groups ---
 groups_data = defaultdict(list)
-print("Step 1: Reading files and gathering groups...")
+print("\nStep 2: Reading files and gathering groups...")
 for file_path in file_list:
     parquet_file = pq.ParquetFile(file_path)
     for batch in parquet_file.iter_batches(batch_size=500_000):
@@ -61,56 +81,31 @@ for file_path in file_list:
             groups_data[group_key].append(group_df)
 print(f"Finished gathering data for {len(groups_data)} unique groups.")
 
-# --- 4. Process Each Group and Write to File ---
-failed_groups = [] # Keep track of groups that cause an error
-print(f"\nStep 2: Cleaning each group and writing to '{output_filename}'...")
+print(f"\nStep 3: Cleaning each group and writing to '{output_filename}'...")
 for group_key, list_of_chunks in tqdm(groups_data.items()):
     try:
-        # --- All processing for a single group happens inside this 'try' block ---
-        
         full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
-        
-        # Sanitize the numeric columns for this specific group
-        for col in numeric_cols:
-            if col in full_group_df.columns:
-                full_group_df[col] = pd.to_numeric(full_group_df[col], errors='coerce')
-                full_group_df[col].fillna(0, inplace=True)
-
         cleaned_group_df = clean_one_group(full_group_df)
         
+        # Convert to a pyarrow Table
         table = pa.Table.from_pandas(cleaned_group_df, preserve_index=False)
         
+        # Force the table to conform to our corrected master schema
+        # This will correctly convert your string columns to string, and numeric to float
+        table = table.cast(master_schema)
+        
         if parquet_writer is None:
-            master_schema = table.schema
             parquet_writer = pq.ParquetWriter(output_filename, master_schema)
         
-        table = table.cast(master_schema)
         parquet_writer.write_table(table)
 
-    except (TypeError, ValueError, pa.ArrowInvalid) as e:
-        # --- If ANY of the above steps fail, this 'except' block will run ---
-        
-        # We print a warning and add the group to our failed list
-        print(f"\nWARNING: Skipping group {group_key} due to a data processing error.")
-        failed_groups.append(group_key)
-        # 'continue' tells the loop to immediately move on to the next group
+    except Exception as e:
+        print(f"\nWARNING: Skipping group {group_key} due to a processing error: {e}")
         continue
 
 if parquet_writer:
     parquet_writer.close()
 
 print(f"\nProcessing complete. Final cleaned data saved to '{output_filename}'.")
-
-# --- 5. Final Summary of Skipped Groups ---
-if failed_groups:
-    print("\n" + "="*35)
-    print("      Summary of Skipped Groups")
-    print("="*35)
-    print(f"A total of {len(failed_groups)} groups were skipped due to fatal data errors.")
-    print("The first 5 skipped groups were:")
-    for group in failed_groups[:5]:
-        print(f"  - {group}")
-else:
-    print("\n--- All groups processed successfully! ---")
 
 
