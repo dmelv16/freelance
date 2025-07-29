@@ -1,0 +1,117 @@
+import pandas as pd
+import numpy as np
+import pyarrow.parquet as pq
+from collections import defaultdict
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import os
+
+# --- 1. The Final Cleaning Function You Provided ---
+# This function applies the advanced, dynamic cleaning logic to a single group's data.
+def clean_one_group(group_df):
+    
+    TOLERANCE_PERCENT = 0.02
+    df = group_df.copy()
+
+    # Ensure voltage column is numeric for calculations, coercing errors
+    df['voltage_28v_dc1_cal'] = pd.to_numeric(df['voltage_28v_dc1_cal'], errors='coerce')
+
+    # First Pass: Calculate dynamic threshold
+    initial_steady_points = df[df['voltage_28v_dc1_cal'] >= 22]
+    dynamic_threshold = 22.0
+    
+    if not initial_steady_points.empty:
+        group_mean_voltage = initial_steady_points['voltage_28v_dc1_cal'].mean()
+        dynamic_threshold = group_mean_voltage * (1 - TOLERANCE_PERCENT)
+
+    def initial_classify(voltage):
+        if pd.isna(voltage): return 'De-energized'
+        if voltage < 2.2: return 'De-energized'
+        elif voltage >= dynamic_threshold: return 'Steady State'
+        else: return 'Stabilizing'
+            
+    df['Cleaned_Status'] = df['voltage_28v_dc1_cal'].apply(initial_classify)
+
+    # Second Pass: Differentiate ramp-up, ramp-down, and dips
+    steady_indices = df.index[df['Cleaned_Status'] == 'Steady State']
+    
+    if not steady_indices.empty:
+        first_steady_index, last_steady_index = steady_indices[0], steady_indices[-1]
+        is_stabilizing = df['Cleaned_Status'] == 'Stabilizing'
+        is_between = (df.index > first_steady_index) & (df.index < last_steady_index)
+        df.loc[is_stabilizing & is_between, 'Cleaned_Status'] = 'Steady State'
+
+    # Overwrite the original status column with the cleaned values
+    df['dc1_status'] = df['Cleaned_Status']
+    
+    # Return the DataFrame, dropping the temporary column
+    return df.drop(columns=['Cleaned_Status'])
+
+# --- 2. Setup ---
+file_list = ['path/to/p1.parquet', 'path/to/p2.parquet']
+group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Aircraft'] 
+output_directory = 'output_plots_cleaned'
+
+# Create the output directory if it doesn't exist
+if not os.path.exists(output_directory):
+    os.makedirs(output_directory)
+    print(f"Created directory: {output_directory}")
+
+# --- 3. Read Files and Gather Groups ---
+groups_data = defaultdict(list)
+print("Step 1: Reading files and gathering groups...")
+for file_path in file_list:
+    parquet_file = pq.ParquetFile(file_path)
+    for batch in parquet_file.iter_batches(batch_size=500_000):
+        chunk = batch.to_pandas()
+        for group_key, group_df in chunk.groupby(group_cols):
+            groups_data[group_key].append(group_df)
+print(f"Finished gathering data for {len(groups_data)} unique groups.")
+
+# --- 4. Loop Through Each Group, Clean, and Create a Plot ---
+print(f"\nStep 2: Cleaning data and generating a plot for each group...")
+
+for group_key, list_of_chunks in tqdm(groups_data.items()):
+    # Combine all the small pieces for this one group into a single DataFrame
+    full_group_df = pd.concat(list_of_chunks).sort_values('timestamp').reset_index(drop=True)
+    
+    # **THIS IS THE NEW STEP**: Run the cleaning function on the group's data
+    cleaned_group_df = clean_one_group(full_group_df)
+    
+    # --- Create a unique filename for the plot ---
+    filename_parts = [f"{col}_{val}" for col, val in zip(group_cols, group_key)]
+    plot_filename = "-".join(filename_parts) + ".png"
+    output_path = os.path.join(output_directory, plot_filename)
+
+    # --- Generate the Plot using the CLEANED data ---
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Define colors for each status
+    color_map = {
+        'De-energized': '#4A90E2', # Blue
+        'Stabilizing': '#F5A623',  # Orange
+        'Steady State': '#7ED321'  # Green
+    }
+    
+    # Plot each status group from the cleaned data with its specific color
+    for status, color in color_map.items():
+        subset = cleaned_group_df[cleaned_group_df['dc1_status'] == status]
+        if not subset.empty:
+            ax.scatter(subset['timestamp'], subset['voltage_28v_dc1_cal'], 
+                       c=color, label=status, s=15, alpha=0.8)
+
+    ax.axhline(22, color='gray', linestyle='--', linewidth=1, label='Original 22V Threshold')
+    
+    title_str = "\n".join(filename_parts)
+    ax.set_title(f"Cleaned Voltage Profile\n{title_str}", fontsize=10)
+    ax.set_xlabel("Timestamp", fontsize=10)
+    ax.set_ylabel("Voltage (voltage_28v_dc1_cal)", fontsize=10)
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.savefig(output_path, dpi=100)
+    
+    # **IMPORTANT**: Close the figure to free up memory
+    plt.close(fig)
+
+print(f"\nProcessing complete. All plots of cleaned data saved to the '{output_directory}' folder.")
