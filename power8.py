@@ -180,41 +180,74 @@ group_cols = ['save', 'unit_id', 'ofp', 'station', 'test_case', 'test_run', 'Air
 output_directory = 'output_data_cleaned'
 output_filename = os.path.join(output_directory, 'cleaned_data_dual_channel_fixed.parquet')
 
-if not os.path.exists(output_directory):
-    os.makedirs(output_directory)
-# --- NEW: Step 1: Load the Exclusion List from an External File ---
+# --- CORRECTED Step 1: Load the Exclusion List and Create Fingerprints ---
 print(f"Step 1: Loading exclusion list from '{exclusion_file_path}'...")
 try:
-    # Read the CSV file into a DataFrame
     df_to_exclude = pd.read_csv(exclusion_file_path)
     
-    # Ensure the columns in the CSV match the group_cols order
-    df_to_exclude = df_to_exclude[group_cols]
+    # Create the unique fingerprint for each row in the exclusion file
+    # This is done by converting every value to a string and joining them with a separator
+    df_to_exclude['fingerprint'] = df_to_exclude[group_cols].astype(str).agg('|'.join, axis=1)
     
-    # Convert the DataFrame rows into a set of tuples for very fast lookups
-    groups_to_remove = set(map(tuple, df_to_exclude.to_numpy()))
+    # Convert the fingerprints into a set for very fast lookups
+    groups_to_remove_fingerprints = set(df_to_exclude['fingerprint'])
     
-    print(f"Loaded {len(groups_to_remove)} unique groups to exclude.")
+    print(f"Loaded {len(groups_to_remove_fingerprints)} unique group fingerprints to exclude.")
 except FileNotFoundError:
     print(f"Warning: Exclusion file not found at '{exclusion_file_path}'. No groups will be excluded.")
-    groups_to_remove = set()
+    groups_to_remove_fingerprints = set()
 except Exception as e:
     print(f"Error loading exclusion file: {e}. No groups will be excluded.")
-    groups_to_remove = set()
-# --- 4. Read Files and Gather Groups ---
+    groups_to_remove_fingerprints = set()
+
+
+# --- CORRECTED Step 2: Read Files and Filter During Ingestion ---
 groups_data = defaultdict(list)
-print("Step 1: Reading files and gathering all groups...")
+print(f"\nStep 2: Reading files and filtering groups during ingestion...")
+total_groups_seen = 0
+groups_kept = 0
 for file_path in file_list:
-    # Code to read files and gather groups... (Same as before)
     columns_to_read = list(set(['timestamp', 'voltage_28v_dc1_cal', 'voltage_28v_dc2_cal'] + group_cols))
-    file_schema = pq.read_schema(file_path)
-    final_columns = [col for col in columns_to_read if col in file_schema.names]
-    parquet_file = pq.ParquetFile(file_path)
-    for batch in parquet_file.iter_batches(batch_size=500_000, columns=final_columns):
-        chunk = batch.to_pandas()
-        for group_key, group_df in chunk.groupby(group_cols):
-            groups_data[group_key].append(group_df)
-print(f"✅ Finished gathering data for {len(groups_data)} unique groups.")
+    try:
+        file_schema = pq.read_schema(file_path)
+        final_columns = [col for col in columns_to_read if col in file_schema.names]
+        parquet_file = pq.ParquetFile(file_path)
+
+        for batch in parquet_file.iter_batches(batch_size=500_000, columns=final_columns):
+            chunk = batch.to_pandas()
+            
+            if chunk.empty:
+                continue
+
+            # Create a temporary fingerprint column in the data being read
+            chunk['fingerprint'] = chunk[group_cols].astype(str).agg('|'.join, axis=1)
+
+            for group_fingerprint, group_df in chunk.groupby('fingerprint'):
+                # THE FILTERING HAPPENS HERE, using the fingerprint
+                if group_fingerprint not in groups_to_remove_fingerprints:
+                    # We need the original tuple key for our dictionary
+                    # Get the first row of the group to reconstruct the key
+                    first_row = group_df.iloc[0]
+                    group_key = tuple(first_row[col] for col in group_cols)
+
+                    if group_key not in groups_data:
+                        total_groups_seen +=1
+                        groups_kept += 1
+
+                    groups_data[group_key].append(group_df.drop(columns=['fingerprint']))
+                else:
+                    # This is a group we want to skip. We find its original key to count it.
+                     first_row = group_df.iloc[0]
+                     group_key = tuple(first_row[col] for col in group_cols)
+                     if group_key not in groups_data:
+                         total_groups_seen +=1
+                         
+    except Exception as e:
+         print(f"Could not read {file_path}, error: {e}")
+
+print(f"✅ Scan complete. Seen {total_groups_seen} unique groups.")
+print(f"Filtered out {total_groups_seen - groups_kept} groups. {groups_kept} groups will be processed.")
+
 
 # --- 5. Define Output Schema ---
 base_schema = pq.read_schema(file_list[0])
