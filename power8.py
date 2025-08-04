@@ -11,14 +11,18 @@ import numpy as np
 def classify_voltage_channel(voltage_series: pd.Series):
     """
     Fast classification that properly identifies the short stabilizing period
-    and locks in steady state without complex loops.
+    and locks in steady state, while handling temporary dips without ending steady state.
     """
     # --- Tunable Parameters ---
     STEADY_VOLTAGE_THRESHOLD = 22
     STABILITY_WINDOW = 10  # Window for checking stability
     STABILITY_THRESHOLD = 0.1  # Max std dev for steady state
     STABILIZING_MAX_DURATION = 0.1  # Max 10% of test can be stabilizing
-    RAMP_DOWN_THRESHOLD = 0.5  # Voltage drop to detect ramp-down
+    
+    # Ramp-down detection parameters
+    RAMP_DOWN_THRESHOLD = 1.0  # Voltage drop to consider ramp-down
+    DIP_RECOVERY_WINDOW = 20  # Points to check for recovery after dip
+    SUSTAINED_DROP_POINTS = 10  # How many points must stay low for true ramp-down
     
     # Vectorized operations for speed
     voltage = pd.to_numeric(voltage_series, errors='coerce').values
@@ -64,37 +68,54 @@ def classify_voltage_channel(voltage_series: pd.Series):
         if stabilizing_end > 0:
             status[start_idx:start_idx + stabilizing_end] = 'Stabilizing'
         
-        # Find the end of steady state by detecting ramp-down
-        steady_mean = np.mean(energized_voltage[stabilizing_end:])
+        # Calculate steady state mean from a good sample
+        # Use points after stabilization that meet steady criteria
+        steady_sample_end = min(stabilizing_end + 100, energized_length)
+        steady_sample = energized_voltage[stabilizing_end:steady_sample_end]
+        steady_mean = np.mean(steady_sample[steady_sample >= STEADY_VOLTAGE_THRESHOLD])
         
-        # Vectorized ramp-down detection
-        # Look for sustained drop from steady state mean
-        voltage_diff = steady_mean - energized_voltage[stabilizing_end:]
+        # Lock in steady state initially
+        status[start_idx + stabilizing_end:end_idx + 1] = 'Steady State'
         
-        # Find where voltage drops significantly
-        ramp_down_mask = voltage_diff > RAMP_DOWN_THRESHOLD
+        # Now check for TRUE ramp-down (not just temporary dips)
+        # Start checking from after initial steady state establishment
+        check_start = stabilizing_end + 50  # Give steady state time to establish
         
-        if np.any(ramp_down_mask):
-            # Find first point of sustained drop
-            ramp_indices = np.where(ramp_down_mask)[0]
-            # Check for sustained drop (not just a spike)
-            for idx in ramp_indices:
-                if idx + 3 < len(voltage_diff):
-                    # Check if drop is sustained for at least 3 points
-                    if np.all(voltage_diff[idx:idx+3] > RAMP_DOWN_THRESHOLD * 0.5):
-                        steady_end = stabilizing_end + idx
+        if check_start < energized_length - SUSTAINED_DROP_POINTS:
+            for i in range(check_start, energized_length - SUSTAINED_DROP_POINTS):
+                current_voltage = energized_voltage[i]
+                
+                # Check if voltage dropped significantly
+                if steady_mean - current_voltage > RAMP_DOWN_THRESHOLD:
+                    # This could be a dip or ramp-down - need to check
+                    
+                    # Look ahead to see if it recovers (temporary dip) or stays down (ramp-down)
+                    look_ahead_window = min(DIP_RECOVERY_WINDOW, energized_length - i)
+                    future_voltages = energized_voltage[i:i + look_ahead_window]
+                    
+                    # Check if voltage recovers
+                    recovery_mask = future_voltages > (steady_mean - RAMP_DOWN_THRESHOLD * 0.5)
+                    if np.sum(recovery_mask) > look_ahead_window * 0.3:
+                        # It recovers - this is just a temporary dip, keep as steady state
+                        continue
+                    
+                    # Check if drop is sustained
+                    sustained_window = min(SUSTAINED_DROP_POINTS, energized_length - i)
+                    sustained_voltages = energized_voltage[i:i + sustained_window]
+                    
+                    # If most points in the window are low, it's a true ramp-down
+                    if np.mean(sustained_voltages) < steady_mean - RAMP_DOWN_THRESHOLD * 0.7:
+                        # This is a true ramp-down
+                        status[start_idx + i:end_idx + 1] = 'Stabilizing'
                         break
-            else:
-                steady_end = energized_length
-        else:
-            steady_end = energized_length
-        
-        # Lock in steady state
-        status[start_idx + stabilizing_end:start_idx + steady_end] = 'Steady State'
-        
-        # Mark any remaining as stabilizing (ramp-down)
-        if steady_end < energized_length:
-            status[start_idx + steady_end:end_idx + 1] = 'Stabilizing'
+                    
+                    # Also check for consistent downward trend
+                    if sustained_window >= 5:
+                        x = np.arange(sustained_window)
+                        slope = np.polyfit(x, sustained_voltages, 1)[0]
+                        if slope < -0.1:  # Consistent downward trend
+                            status[start_idx + i:end_idx + 1] = 'Stabilizing'
+                            break
     else:
         # No stable points found - all stabilizing
         status[start_idx:end_idx + 1] = 'Stabilizing'
