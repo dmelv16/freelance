@@ -6,7 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 import os
 
-# --- 1. CORRECTED: Core Helper Function ---
+# --- 1. DEFINITIVELY CORRECTED: Core Helper Function ---
 def classify_voltage_channel(voltage_series: pd.Series):
     """
     Analyzes a single series of voltage data and returns a series of status strings.
@@ -30,18 +30,22 @@ def classify_voltage_channel(voltage_series: pd.Series):
         return 'Stabilizing'
     temp_df['status'] = temp_df.apply(classify_row, axis=1)
 
-    # --- REVISED: Pass 3 - Iterative Correction for Dips and End-of-Sequence ---
-    steady_indices = temp_df.index[temp_df['status'] == 'Steady State']
-    if not steady_indices.empty:
-        first_steady_index = steady_indices[0]
-        
-        # Get initial steady state block for calculating a running mean
-        steady_mask = temp_df.index <= first_steady_index
+    # --- REBUILT: Pass 3 - Iterative Correction for Dips and End-of-Sequence ---
+    initial_steady_indices = temp_df.index[temp_df['status'] == 'Steady State']
+    
+    if not initial_steady_indices.empty:
+        first_steady_index = initial_steady_indices[0]
+
+        # THE FIX: Create steady_mask as a proper Pandas Series.
+        # Initialize the mask based on the initial classification.
+        steady_mask = (temp_df['status'] == 'Steady State').copy()
         
         # Loop forward from the first steady point to handle all subsequent points
         for i in range(first_steady_index + 1, len(temp_df)):
+            # Only attempt to correct points that are currently 'Stabilizing'
             if temp_df.at[i, 'status'] == 'Stabilizing':
-                # Update the running mean of the confirmed steady block so far
+                
+                # The running mean is now correctly calculated using the updating Pandas mask
                 mean_steady_voltage = temp_df.loc[steady_mask, 'voltage'].mean()
                 
                 current_voltage = temp_df.at[i, 'voltage']
@@ -52,17 +56,15 @@ def classify_voltage_channel(voltage_series: pd.Series):
                 has_no_immediate_drop = current_voltage >= (previous_voltage - IMMEDIATE_DROP_TOLERANCE)
 
                 if is_close_to_average and has_no_immediate_drop:
-                    # If conditions are met, expand the steady block
+                    # If conditions pass, update both the status and our running mask
                     temp_df.at[i, 'status'] = 'Steady State'
-                    steady_mask.at[i] = True
+                    steady_mask.at[i] = True  # This now works because steady_mask is a Series
                 else:
-                    # If conditions fail, this is a true ramp-down; stop extending the block
+                    # If conditions fail, this is a true ramp-down; stop trying to extend the block
                     break
-            elif temp_df.at[i, 'status'] == 'Steady State':
-                 # If a point was already steady, ensure it's part of our mask
-                 steady_mask.at[i] = True
     
     return temp_df['status']
+
 
 # --- 2. ORCHESTRATOR FUNCTION (No changes needed) ---
 def clean_dc_channels(group_df):
