@@ -77,7 +77,7 @@ def create_fingerprint(df: pd.DataFrame, cols: list) -> pd.Series:
             temp_df[col] = temp_df[col].map('{:.6f}'.format).str.rstrip('0').str.rstrip('.')
         else:
             temp_df[col] = temp_df[col].astype(str)
-    return temp_df.agg('|'.join, axis=1)
+    return temp_df.agg('|'.join', axis=1)
 
 # --- INSERTED: Load the Exclusion List ---
 print(f"Step 1: Loading exclusion list from '{exclusion_file_path}'...")
@@ -94,40 +94,39 @@ except Exception as e:
     print(f"Error loading exclusion file: {e}. No groups will be excluded.")
     groups_to_remove_fingerprints = set()
 
-# --- 3. Read Files and Gather Groups (with filtering) ---
+# --- 4. MODIFIED: Read Files, Pre-Filter Rows, and Then Group ---
 groups_data = defaultdict(list)
-print(f"\nStep 2: Reading files and filtering groups...")
-total_groups_seen = 0
-groups_kept = 0
+print(f"\nStep 2: Reading files, filtering rows, and gathering groups...")
 for file_path in file_list:
     columns_to_read = list(set(['timestamp', 'voltage_28v_dc1_cal', 'voltage_28v_dc2_cal'] + group_cols))
     try:
         file_schema = pq.read_schema(file_path)
         final_columns = [col for col in columns_to_read if col in file_schema.names]
         parquet_file = pq.ParquetFile(file_path)
+        
         for batch in parquet_file.iter_batches(batch_size=500_000, columns=final_columns):
             chunk = batch.to_pandas()
-            if chunk.empty: continue
-            
+            if chunk.empty:
+                continue
+
+            # --- PRE-FILTERING LOGIC ---
+            # 1. Create fingerprints for the incoming data chunk
             chunk_fingerprints = create_fingerprint(chunk, group_cols)
-            chunk['fingerprint'] = chunk_fingerprints
+            
+            # 2. Find which rows to KEEP
+            mask_to_keep = ~chunk_fingerprints.isin(groups_to_remove_fingerprints)
+            
+            # 3. Create a new DataFrame containing only the rows we want to keep
+            filtered_chunk = chunk[mask_to_keep]
 
-            for group_fingerprint, group_df in chunk.groupby('fingerprint'):
-                if group_fingerprint not in groups_to_remove_fingerprints:
-                    first_row = group_df.iloc[0]
-                    group_key = tuple(first_row[col] for col in group_cols)
-                    if group_key not in groups_data:
-                        total_groups_seen +=1
-                        groups_kept += 1
-                    groups_data[group_key].append(group_df.drop(columns=['fingerprint']))
-                else:
-                    if 'group_key' not in locals() or group_key not in groups_data:
-                        total_groups_seen +=1
+            # 4. Now, group the CLEAN, pre-filtered data
+            if not filtered_chunk.empty:
+                for group_key, group_df in filtered_chunk.groupby(group_cols):
+                    groups_data[group_key].append(group_df)
+                    
     except Exception as e:
-         print(f"Could not read {file_path}, error: {e}")
-
-print(f"✅ Scan complete. Seen {total_groups_seen} unique groups.")
-print(f"Filtered out {total_groups_seen - groups_kept} groups. {groups_kept} groups remaining for plotting.")
+        print(f"Could not read {file_path}, error: {e}")
+print(f"✅ Finished gathering data for {len(groups_data)} unique groups.")
 
 # --- 4. Loop Through Each Group, Clean, and Create a Plot ---
 print(f"\nStep 3: Cleaning data and generating a plot for each group...")
