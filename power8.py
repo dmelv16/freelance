@@ -6,65 +6,79 @@ from collections import defaultdict
 from tqdm import tqdm
 import os
 
-# --- 1. CORE HELPER FUNCTION (With new "Fourth Pass") ---
+# --- 1. CORE HELPER FUNCTION (With Dual-Condition Check) ---
 def classify_voltage_channel(voltage_series: pd.Series):
     """
     Analyzes a single series of voltage data and returns a series of status strings.
     """
     # --- Tunable Parameters ---
-    STEADY_VOLTAGE_THRESHOLD = 22
+    STEADY_VOLTAGE_THRESHOLD = 22      # The general threshold to be considered "on"
     STABILITY_WINDOW = 5
     STABILITY_THRESHOLD = 0.05
-    
+    STEADY_VOLTAGE_TOLERANCE = 1.5     # How close voltage must be to the steady average
+    # NEW: Max allowable voltage drop from one point to the next in a steady state
+    IMMEDIATE_DROP_TOLERANCE = 0.2     # e.g., A drop > 0.2V signals a ramp-down
+
     temp_df = pd.DataFrame({'voltage': pd.to_numeric(voltage_series, errors='coerce')})
     temp_df['stability'] = temp_df['voltage'].rolling(window=STABILITY_WINDOW).std()
-    
+
+    # --- Pass 1 & 2: Initial Classification ---
     def classify_row(row):
         if pd.isna(row['voltage']) or row['voltage'] < 2.2:
             return 'De-energized'
         if row['voltage'] >= STEADY_VOLTAGE_THRESHOLD and not pd.isna(row['stability']) and row['stability'] < STABILITY_THRESHOLD:
             return 'Steady State'
         return 'Stabilizing'
-
     temp_df['status'] = temp_df.apply(classify_row, axis=1)
 
-    # --- Third Pass: Clean up brief dips WITHIN a steady state block ---
+    # --- Pass 3: Clean up brief dips WITHIN a steady state block ---
     steady_indices = temp_df.index[temp_df['status'] == 'Steady State']
     if not steady_indices.empty:
         first_steady, last_steady = steady_indices[0], steady_indices[-1]
         is_stabilizing_middle = temp_df['status'] == 'Stabilizing'
         is_between = (temp_df.index > first_steady) & (temp_df.index < last_steady)
         temp_df.loc[is_stabilizing_middle & is_between, 'status'] = 'Steady State'
-        
-        # --- NEW: Fourth Pass for End-of-Sequence Correction ---
-        # Find the last valid 'Steady State' point after the middle-pass cleanup
-        last_steady_index = temp_df.index[temp_df['status'] == 'Steady State'][-1]
-        
-        # Find points AFTER this that are 'Stabilizing' but still have high voltage
-        is_stabilizing_end = temp_df['status'] == 'Stabilizing'
-        is_after_last_steady = temp_df.index > last_steady_index
-        has_high_voltage = temp_df['voltage'] >= STEADY_VOLTAGE_THRESHOLD
-        
-        # Correct these points to 'Steady State'
-        temp_df.loc[is_stabilizing_end & is_after_last_steady & has_high_voltage, 'status'] = 'Steady State'
-        
+
+        # --- REVISED: Pass 4 - Iterative End-of-Sequence Correction ---
+        current_steady_mask = temp_df['status'] == 'Steady State'
+        if current_steady_mask.any():
+            mean_steady_voltage = temp_df.loc[current_steady_mask, 'voltage'].mean()
+            last_steady_index = temp_df.index[current_steady_mask][-1]
+
+            # Loop point-by-point from the last known steady state
+            for i in range(last_steady_index + 1, len(temp_df)):
+                # Only check points that are currently 'Stabilizing'
+                if temp_df.at[i, 'status'] == 'Stabilizing':
+                    current_voltage = temp_df.at[i, 'voltage']
+                    previous_voltage = temp_df.at[i - 1, 'voltage']
+
+                    # Condition 1: Is it close to the overall average?
+                    is_close_to_average = abs(current_voltage - mean_steady_voltage) < STEADY_VOLTAGE_TOLERANCE
+                    
+                    # Condition 2: Did it just drop significantly from the last point?
+                    has_no_immediate_drop = current_voltage >= (previous_voltage - IMMEDIATE_DROP_TOLERANCE)
+
+                    if is_close_to_average and has_no_immediate_drop:
+                        # If both conditions are met, we can confidently call it 'Steady State'
+                        temp_df.at[i, 'status'] = 'Steady State'
+                    else:
+                        # If either condition fails, it's a true ramp-down. Stop correcting.
+                        break
+                        
     return temp_df['status']
 
 
-# --- 2. ORCHESTRATOR FUNCTION (No changes needed here) ---
+# --- 2. ORCHESTRATOR FUNCTION (No changes needed) ---
 def clean_dc_channels(group_df):
     """
-    Orchestrates the cleaning of both DC1 and DC2 channels using a fixed threshold.
+    Orchestrates the cleaning of both DC1 and DC2 channels.
     """
     df = group_df.copy()
-    
     df['dc1_status'] = classify_voltage_channel(df['voltage_28v_dc1_cal'])
-    
     if 'voltage_28v_dc2_cal' in df.columns:
         df['dc2_status'] = classify_voltage_channel(df['voltage_28v_dc2_cal'])
     else:
         df['dc2_status'] = 'De-energized'
-        
     return df
 
 # --- 3. Setup ---
