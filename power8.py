@@ -182,7 +182,25 @@ output_filename = os.path.join(output_directory, 'cleaned_data_dual_channel_fixe
 
 if not os.path.exists(output_directory):
     os.makedirs(output_directory)
-
+# --- NEW: Step 1: Load the Exclusion List from an External File ---
+print(f"Step 1: Loading exclusion list from '{exclusion_file_path}'...")
+try:
+    # Read the CSV file into a DataFrame
+    df_to_exclude = pd.read_csv(exclusion_file_path)
+    
+    # Ensure the columns in the CSV match the group_cols order
+    df_to_exclude = df_to_exclude[group_cols]
+    
+    # Convert the DataFrame rows into a set of tuples for very fast lookups
+    groups_to_remove = set(map(tuple, df_to_exclude.to_numpy()))
+    
+    print(f"Loaded {len(groups_to_remove)} unique groups to exclude.")
+except FileNotFoundError:
+    print(f"Warning: Exclusion file not found at '{exclusion_file_path}'. No groups will be excluded.")
+    groups_to_remove = set()
+except Exception as e:
+    print(f"Error loading exclusion file: {e}. No groups will be excluded.")
+    groups_to_remove = set()
 # --- 4. Read Files and Gather Groups ---
 groups_data = defaultdict(list)
 print("Step 1: Reading files and gathering all groups...")
