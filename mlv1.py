@@ -11,94 +11,115 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # =============================================================================
-# 1. DATA GENERATION WITH REALISTIC PATTERNS
+# 1. DATA LOADING AND PREPROCESSING
 # =============================================================================
 
-def generate_realistic_power_data(n_samples=10000, n_test_runs=10):
+def load_power_data(filepath):
     """
-    Generate synthetic power data with realistic patterns for each state
+    Load power data from parquet file
+    
+    Expected columns:
+    - timestamp or similar time column
+    - dc1_voltage, dc1_current, dc1_status
+    - dc2_voltage, dc2_current, dc2_status
+    - test_run or similar grouping column
     """
-    data = []
-    samples_per_run = n_samples // n_test_runs
+    print(f"Loading data from {filepath}...")
+    df = pd.read_parquet(filepath)
     
-    for run_id in range(n_test_runs):
-        run_data = []
-        
-        # Each run has different state transitions
-        for i in range(samples_per_run):
-            # Determine state based on position in run
-            if i < samples_per_run * 0.3:
-                state = 'stabilizing'
-                # Stabilizing: oscillations that gradually decrease
-                t = i / 100
-                voltage = 400 + 20 * np.exp(-t/10) * np.sin(t*5) + np.random.randn() * 2
-                current = 50 + 5 * np.exp(-t/10) * np.cos(t*5) + np.random.randn() * 0.5
-            elif i < samples_per_run * 0.4:
-                state = 'de-energized'
-                # De-energized: sharp drop to near zero
-                decay_factor = max(0, 1 - (i - samples_per_run * 0.3) / (samples_per_run * 0.05))
-                voltage = 400 * decay_factor + np.random.randn() * 0.1
-                current = 50 * decay_factor + np.random.randn() * 0.05
-            else:
-                state = 'steady_state'
-                # Steady state: stable values with low noise
-                voltage = 400 + np.random.randn() * 0.5
-                current = 50 + np.random.randn() * 0.1
-            
-            run_data.append({
-                'timestamp': pd.Timestamp('2024-01-01') + pd.Timedelta(milliseconds=i),
-                'dc1_voltage': voltage,
-                'dc1_current': current,
-                'status': state,
-                'test_run': run_id
-            })
-        
-        data.extend(run_data)
+    print(f"Loaded {len(df)} rows")
+    print(f"Columns: {df.columns.tolist()}")
     
-    return pd.DataFrame(data)
+    # Check for required columns
+    required_cols = ['dc1_voltage', 'dc1_current', 'dc1_status', 
+                     'dc2_voltage', 'dc2_current', 'dc2_status']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        print(f"Warning: Missing columns {missing_cols}")
+        print("Available columns:", df.columns.tolist())
+    
+    # Display data info
+    print("\nData Overview:")
+    print(f"Shape: {df.shape}")
+    if 'dc1_status' in df.columns:
+        print(f"DC1 Status distribution: {df['dc1_status'].value_counts().to_dict()}")
+    if 'dc2_status' in df.columns:
+        print(f"DC2 Status distribution: {df['dc2_status'].value_counts().to_dict()}")
+    
+    return df
 
 # =============================================================================
-# 2. ENHANCED DATA PROCESSOR WITH DUAL PATHS
+# 2. DUAL DC SYSTEM DATA PROCESSOR
 # =============================================================================
 
-class PowerDataProcessor:
-    """Handles data windowing with options for both feature engineering and raw sequences"""
+class DualDCPowerDataProcessor:
+    """Handles data windowing for dual DC systems with separate processing"""
     
     def __init__(self, window_size=100, stride=10):
         """
         Args:
-            window_size: Number of milliseconds in each window
+            window_size: Number of milliseconds/samples in each window
             stride: Step size for sliding window
         """
         self.window_size = window_size
         self.stride = stride
-        self.scaler = StandardScaler()
-        self.feature_scaler = StandardScaler()
-        self.label_encoder = LabelEncoder()
         
-    def create_windows(self, df, group_col='test_run', engineer_features=True):
+        # Separate scalers and encoders for each DC system
+        self.dc1_scaler = StandardScaler()
+        self.dc1_feature_scaler = StandardScaler()
+        self.dc1_label_encoder = LabelEncoder()
+        
+        self.dc2_scaler = StandardScaler()
+        self.dc2_feature_scaler = StandardScaler()
+        self.dc2_label_encoder = LabelEncoder()
+        
+    def create_windows_for_dc(self, df, dc_num, group_col='test_run', engineer_features=True):
         """
-        Create sliding windows from time series data
+        Create sliding windows for a specific DC system
         
         Args:
-            df: DataFrame with columns [timestamp, dc1_voltage, dc1_current, status, test_run]
-            group_col: Column to group by
+            df: DataFrame with power data
+            dc_num: 1 or 2 for DC1 or DC2
+            group_col: Column to group by (e.g., 'test_run')
             engineer_features: If True, return engineered features; if False, return raw sequences
         """
+        voltage_col = f'dc{dc_num}_voltage'
+        current_col = f'dc{dc_num}_current'
+        status_col = f'dc{dc_num}_status'
+        
+        # Check if columns exist
+        if not all(col in df.columns for col in [voltage_col, current_col, status_col]):
+            print(f"Warning: DC{dc_num} columns not found in dataframe")
+            return None, None, None
+        
         windows = []
         labels = []
         groups = []
         
+        # If no group column specified, treat all data as one group
+        if group_col not in df.columns:
+            print(f"Warning: '{group_col}' not found, treating all data as single group")
+            df['temp_group'] = 0
+            group_col = 'temp_group'
+        
         for group_name, group_df in df.groupby(group_col):
-            group_df = group_df.sort_values('timestamp').reset_index(drop=True)
+            # Sort by timestamp if available
+            if 'timestamp' in group_df.columns:
+                group_df = group_df.sort_values('timestamp')
+            group_df = group_df.reset_index(drop=True)
             
-            # Create windows for this test run
+            # Create windows for this group
             for i in range(0, len(group_df) - self.window_size + 1, self.stride):
                 window_data = group_df.iloc[i:i + self.window_size]
                 
                 # Extract raw signals
-                voltage = window_data['dc1_voltage'].values
-                current = window_data['dc1_current'].values
+                voltage = window_data[voltage_col].values
+                current = window_data[current_col].values
+                
+                # Skip windows with NaN values
+                if np.any(np.isnan(voltage)) or np.any(np.isnan(current)):
+                    continue
                 
                 if engineer_features:
                     # Path A: Engineer features for traditional ML
@@ -110,10 +131,14 @@ class PowerDataProcessor:
                     windows.append(raw_sequence)
                 
                 # Use the label at the end of the window
-                label = window_data['status'].iloc[-1]
+                label = window_data[status_col].iloc[-1]
                 labels.append(label)
                 groups.append(group_name)
         
+        if len(windows) == 0:
+            print(f"Warning: No valid windows created for DC{dc_num}")
+            return None, None, None
+            
         return np.array(windows), np.array(labels), np.array(groups)
     
     def _engineer_features(self, voltage, current):
@@ -140,32 +165,56 @@ class PowerDataProcessor:
             
             # Rate of change features
             diff = np.diff(signal)
-            features.extend([
-                np.mean(diff),
-                np.std(diff),
-                np.max(np.abs(diff)),
-            ])
+            if len(diff) > 0:
+                features.extend([
+                    np.mean(diff),
+                    np.std(diff),
+                    np.max(np.abs(diff)),
+                ])
+            else:
+                features.extend([0, 0, 0])
             
             # Trend features
-            x = np.arange(len(signal))
-            slope, intercept = np.polyfit(x, signal, 1)
-            features.append(slope)
+            if len(signal) > 1:
+                x = np.arange(len(signal))
+                slope, intercept = np.polyfit(x, signal, 1)
+                features.append(slope)
+            else:
+                features.append(0)
             
             # Additional time-series features
-            features.extend([
-                np.sum(np.abs(diff)),  # Total variation
-                len(np.where(np.diff(np.sign(diff)))[0]),  # Number of peaks
-            ])
+            if len(diff) > 0:
+                features.extend([
+                    np.sum(np.abs(diff)),  # Total variation
+                    len(np.where(np.diff(np.sign(diff)))[0]),  # Number of peaks
+                ])
+            else:
+                features.extend([0, 0])
         
         # Cross-signal features
-        features.append(np.corrcoef(voltage, current)[0, 1])
+        if len(voltage) > 1 and len(current) > 1:
+            corr = np.corrcoef(voltage, current)[0, 1]
+            features.append(corr if not np.isnan(corr) else 0)
+        else:
+            features.append(0)
         
         return np.array(features)
     
-    def prepare_data(self, X, y, groups, test_runs_for_test, is_sequence=False):
+    def prepare_data_for_dc(self, X, y, groups, test_runs_for_test, dc_num, is_sequence=False):
         """
-        Split data by test runs and scale features
+        Split data by test runs and scale features for a specific DC system
         """
+        if X is None or len(X) == 0:
+            return None, None, None, None, None, None
+            
+        # Select appropriate scaler and encoder based on DC number
+        if dc_num == 1:
+            scaler = self.dc1_scaler if is_sequence else self.dc1_feature_scaler
+            label_encoder = self.dc1_label_encoder
+        else:
+            scaler = self.dc2_scaler if is_sequence else self.dc2_feature_scaler
+            label_encoder = self.dc2_label_encoder
+        
         # Create masks for train and test
         test_mask = np.isin(groups, test_runs_for_test)
         train_mask = ~test_mask
@@ -174,6 +223,10 @@ class PowerDataProcessor:
         X_train, X_test = X[train_mask], X[test_mask]
         y_train, y_test = y[train_mask], y[test_mask]
         
+        if len(X_train) == 0 or len(X_test) == 0:
+            print(f"Warning: Empty train or test set for DC{dc_num}")
+            return None, None, None, None, None, None
+        
         # Scale features
         if is_sequence:
             # For sequences, scale along the feature dimension
@@ -181,19 +234,19 @@ class PowerDataProcessor:
             X_train_flat = X_train.reshape(-1, X_train.shape[-1])
             X_test_flat = X_test.reshape(-1, X_test.shape[-1])
             
-            X_train_flat = self.scaler.fit_transform(X_train_flat)
-            X_test_flat = self.scaler.transform(X_test_flat)
+            X_train_flat = scaler.fit_transform(X_train_flat)
+            X_test_flat = scaler.transform(X_test_flat)
             
             X_train = X_train_flat.reshape(original_shape)
             X_test = X_test_flat.reshape(X_test.shape)
         else:
             # For engineered features, standard scaling
-            X_train = self.feature_scaler.fit_transform(X_train)
-            X_test = self.feature_scaler.transform(X_test)
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
         
         # Encode labels
-        y_train_encoded = self.label_encoder.fit_transform(y_train)
-        y_test_encoded = self.label_encoder.transform(y_test)
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        y_test_encoded = label_encoder.transform(y_test)
         
         return X_train, X_test, y_train_encoded, y_test_encoded, y_train, y_test
 
@@ -209,13 +262,11 @@ class TraditionalMLModels:
         
     def train_xgboost(self, X_train, y_train, X_test, y_test):
         """Train XGBoost model"""
-        print("\nTraining XGBoost...")
-        
         model = xgb.XGBClassifier(
             n_estimators=200,
             max_depth=6,
             learning_rate=0.1,
-            objective='multi:softprob',
+            objective='multi:softprob' if self.n_classes > 2 else 'binary:logistic',
             random_state=42,
             n_jobs=-1
         )
@@ -234,8 +285,6 @@ class TraditionalMLModels:
     
     def train_lightgbm(self, X_train, y_train, X_test, y_test):
         """Train LightGBM model"""
-        print("\nTraining LightGBM...")
-        
         model = lgb.LGBMClassifier(
             n_estimators=200,
             max_depth=6,
@@ -259,8 +308,6 @@ class TraditionalMLModels:
     
     def train_random_forest(self, X_train, y_train, X_test, y_test):
         """Train Random Forest model"""
-        print("\nTraining Random Forest...")
-        
         model = RandomForestClassifier(
             n_estimators=200,
             max_depth=10,
@@ -304,20 +351,17 @@ class SequenceModels:
     
     def __init__(self, window_size, n_features, n_classes):
         self.window_size = window_size
-        self.n_features = n_features  # Number of raw features (e.g., 2 for voltage and current)
+        self.n_features = n_features
         self.n_classes = n_classes
         
     def build_lstm_model(self):
         """Build LSTM model for actual sequences"""
         model = models.Sequential([
-            # LSTM expects (batch, timesteps, features)
             layers.LSTM(128, return_sequences=True, 
                        input_shape=(self.window_size, self.n_features)),
             layers.Dropout(0.2),
             layers.LSTM(64, return_sequences=False),
             layers.Dropout(0.2),
-            
-            # Dense layers
             layers.Dense(32, activation='relu'),
             layers.Dropout(0.2),
             layers.Dense(self.n_classes, activation='softmax')
@@ -334,15 +378,12 @@ class SequenceModels:
     def build_cnn1d_model(self):
         """Build 1D CNN model for sequences"""
         model = models.Sequential([
-            # 1D Conv expects (batch, timesteps, features)
             layers.Conv1D(64, kernel_size=5, activation='relu', 
                          input_shape=(self.window_size, self.n_features)),
             layers.MaxPooling1D(2),
             layers.Conv1D(128, kernel_size=3, activation='relu'),
             layers.MaxPooling1D(2),
             layers.Conv1D(64, kernel_size=3, activation='relu'),
-            
-            # Global pooling and dense layers
             layers.GlobalAveragePooling1D(),
             layers.Dense(64, activation='relu'),
             layers.Dropout(0.3),
@@ -360,65 +401,16 @@ class SequenceModels:
     def build_cnn_lstm_model(self):
         """Build CNN-LSTM hybrid for sequences"""
         model = models.Sequential([
-            # CNN for feature extraction
             layers.Conv1D(64, kernel_size=3, activation='relu',
                          input_shape=(self.window_size, self.n_features)),
             layers.Conv1D(64, kernel_size=3, activation='relu'),
             layers.MaxPooling1D(2),
-            
-            # LSTM for sequence modeling
             layers.LSTM(50, return_sequences=False),
             layers.Dropout(0.2),
-            
-            # Dense layers
             layers.Dense(32, activation='relu'),
             layers.Dropout(0.2),
             layers.Dense(self.n_classes, activation='softmax')
         ])
-        
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        return model
-    
-    def build_transformer_model(self):
-        """Build Transformer model for sequences"""
-        inputs = layers.Input(shape=(self.window_size, self.n_features))
-        
-        # Linear projection to embedding dimension
-        d_model = 64
-        x = layers.Dense(d_model)(inputs)
-        
-        # Positional encoding (simplified)
-        positions = tf.range(start=0, limit=self.window_size, delta=1)
-        positions = tf.expand_dims(positions, 0)
-        positions = tf.cast(positions, tf.float32)
-        position_embedding = layers.Embedding(self.window_size, d_model)(positions)
-        x = x + position_embedding
-        
-        # Transformer block
-        attention_output = layers.MultiHeadAttention(
-            num_heads=4, key_dim=d_model
-        )(x, x)
-        x1 = layers.Dropout(0.1)(attention_output)
-        x1 = layers.LayerNormalization(epsilon=1e-6)(x + x1)
-        
-        # Feed forward network
-        ff = layers.Dense(128, activation='relu')(x1)
-        ff = layers.Dense(d_model)(ff)
-        x2 = layers.Dropout(0.1)(ff)
-        x2 = layers.LayerNormalization(epsilon=1e-6)(x1 + x2)
-        
-        # Global pooling and output
-        x = layers.GlobalAveragePooling1D()(x2)
-        x = layers.Dense(32, activation='relu')(x)
-        x = layers.Dropout(0.3)(x)
-        outputs = layers.Dense(self.n_classes, activation='softmax')(x)
-        
-        model = models.Model(inputs=inputs, outputs=outputs)
         
         model.compile(
             optimizer='adam',
@@ -435,7 +427,6 @@ class SequenceModels:
 def train_neural_network(model, X_train, y_train, X_test, y_test, 
                         model_name="Model", epochs=50, batch_size=32):
     """Train and evaluate a neural network model"""
-    print(f"\nTraining {model_name}...")
     
     # Callbacks
     early_stop = callbacks.EarlyStopping(
@@ -467,115 +458,114 @@ def train_neural_network(model, X_train, y_train, X_test, y_test,
     y_pred = model.predict(X_test, verbose=0)
     y_pred_classes = np.argmax(y_pred, axis=1)
     
-    print(f"   {model_name} Test Accuracy: {test_accuracy:.4f}")
-    
     return history, y_pred_classes, test_accuracy
 
-# =============================================================================
-# 6. MAIN EXECUTION SCRIPT
-# =============================================================================
-
-def main():
+def train_models_for_dc(processor, df, dc_num, test_runs, results_dict):
     """
-    Main execution function comparing both paths
+    Train all models for a specific DC system
     """
-    print("=" * 80)
-    print("POWER DATA CLASSIFICATION: COMPARING FEATURE ENGINEERING VS RAW SEQUENCES")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"PROCESSING DC{dc_num} SYSTEM")
+    print(f"{'='*80}")
     
-    # Generate realistic synthetic data
-    print("\n1. Generating realistic power data...")
-    df = generate_realistic_power_data(n_samples=20000, n_test_runs=10)
-    print(f"   Generated {len(df)} samples from {df['test_run'].nunique()} test runs")
-    print(f"   Status distribution:")
-    for status, count in df['status'].value_counts().items():
-        print(f"      {status}: {count} ({count/len(df)*100:.1f}%)")
-    
-    # Initialize processor
-    processor = PowerDataProcessor(window_size=100, stride=20)
-    
-    # Define test runs (30% for testing)
-    unique_runs = df['test_run'].unique()
-    n_test_runs = max(1, int(len(unique_runs) * 0.3))
-    test_runs = np.random.choice(unique_runs, n_test_runs, replace=False)
-    print(f"\n   Using test runs {sorted(test_runs)} for testing")
-    
-    results = {}
+    dc_results = {}
     
     # =========================================================================
-    # PATH A: ENGINEERED FEATURES WITH TRADITIONAL ML
+    # PATH A: ENGINEERED FEATURES
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("PATH A: ENGINEERED FEATURES WITH TRADITIONAL ML MODELS")
-    print("=" * 80)
+    print(f"\nPath A: Engineered Features for DC{dc_num}")
+    print("-" * 40)
     
     # Create windows with feature engineering
-    print("\n2. Creating windows with engineered features...")
-    X_features, y, groups = processor.create_windows(df, engineer_features=True)
-    print(f"   Created {len(X_features)} windows with {X_features.shape[1]} engineered features")
+    X_features, y, groups = processor.create_windows_for_dc(df, dc_num, engineer_features=True)
+    
+    if X_features is None:
+        print(f"Skipping DC{dc_num} - no valid data")
+        return
+    
+    print(f"Created {len(X_features)} windows with {X_features.shape[1]} engineered features")
     
     # Prepare data
-    X_train_feat, X_test_feat, y_train, y_test, y_train_orig, y_test_orig = processor.prepare_data(
-        X_features, y, groups, test_runs, is_sequence=False
+    X_train_feat, X_test_feat, y_train, y_test, y_train_orig, y_test_orig = processor.prepare_data_for_dc(
+        X_features, y, groups, test_runs, dc_num, is_sequence=False
     )
-    print(f"   Training samples: {len(X_train_feat)}")
-    print(f"   Testing samples: {len(X_test_feat)}")
+    
+    if X_train_feat is None:
+        print(f"Skipping DC{dc_num} - insufficient data for train/test split")
+        return
+    
+    print(f"Training samples: {len(X_train_feat)}, Testing samples: {len(X_test_feat)}")
     
     # Get number of classes
     n_classes = len(np.unique(y_train))
+    print(f"Number of classes: {n_classes}")
     
     # Train traditional ML models
-    print("\n3. Training traditional ML models on engineered features...")
+    print(f"\nTraining traditional ML models for DC{dc_num}...")
     
     trad_ml = TraditionalMLModels(n_classes)
     
     # XGBoost
+    print("  Training XGBoost...")
     xgb_model, xgb_pred, xgb_acc = trad_ml.train_xgboost(
         X_train_feat, y_train, X_test_feat, y_test
     )
-    results['XGBoost (Features)'] = xgb_acc
-    print(f"   XGBoost Accuracy: {xgb_acc:.4f}")
+    dc_results[f'XGBoost'] = xgb_acc
+    print(f"    Accuracy: {xgb_acc:.4f}")
     
     # LightGBM
+    print("  Training LightGBM...")
     lgb_model, lgb_pred, lgb_acc = trad_ml.train_lightgbm(
         X_train_feat, y_train, X_test_feat, y_test
     )
-    results['LightGBM (Features)'] = lgb_acc
-    print(f"   LightGBM Accuracy: {lgb_acc:.4f}")
+    dc_results[f'LightGBM'] = lgb_acc
+    print(f"    Accuracy: {lgb_acc:.4f}")
     
     # Random Forest
+    print("  Training Random Forest...")
     rf_model, rf_pred, rf_acc = trad_ml.train_random_forest(
         X_train_feat, y_train, X_test_feat, y_test
     )
-    results['Random Forest (Features)'] = rf_acc
-    print(f"   Random Forest Accuracy: {rf_acc:.4f}")
+    dc_results[f'Random Forest'] = rf_acc
+    print(f"    Accuracy: {rf_acc:.4f}")
     
-    # MLP on features
+    # MLP
+    print("  Training MLP...")
     mlp_model = trad_ml.build_mlp(X_train_feat.shape[1])
     mlp_hist, mlp_pred, mlp_acc = train_neural_network(
         mlp_model, X_train_feat, y_train, X_test_feat, y_test,
         model_name="MLP", epochs=50
     )
-    results['MLP (Features)'] = mlp_acc
+    dc_results[f'MLP'] = mlp_acc
+    print(f"    Accuracy: {mlp_acc:.4f}")
     
     # =========================================================================
-    # PATH B: RAW SEQUENCES WITH DEEP LEARNING
+    # PATH B: RAW SEQUENCES
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("PATH B: RAW SEQUENCES WITH DEEP LEARNING MODELS")
-    print("=" * 80)
+    print(f"\nPath B: Raw Sequences for DC{dc_num}")
+    print("-" * 40)
     
     # Create windows with raw sequences
-    print("\n4. Creating windows with raw sequences...")
-    X_sequences, y_seq, groups_seq = processor.create_windows(df, engineer_features=False)
-    print(f"   Created {len(X_sequences)} sequences of shape {X_sequences.shape[1:]} (timesteps, features)")
+    X_sequences, y_seq, groups_seq = processor.create_windows_for_dc(df, dc_num, engineer_features=False)
+    
+    if X_sequences is None:
+        print(f"Skipping sequence models for DC{dc_num} - no valid data")
+        results_dict[f'DC{dc_num}'] = dc_results
+        return
+    
+    print(f"Created {len(X_sequences)} sequences of shape {X_sequences.shape[1:]} (timesteps, features)")
     
     # Prepare sequence data
-    X_train_seq, X_test_seq, y_train_seq, y_test_seq, _, _ = processor.prepare_data(
-        X_sequences, y_seq, groups_seq, test_runs, is_sequence=True
+    X_train_seq, X_test_seq, y_train_seq, y_test_seq, _, _ = processor.prepare_data_for_dc(
+        X_sequences, y_seq, groups_seq, test_runs, dc_num, is_sequence=True
     )
-    print(f"   Training sequences: {X_train_seq.shape}")
-    print(f"   Testing sequences: {X_test_seq.shape}")
+    
+    if X_train_seq is None:
+        print(f"Skipping sequence models for DC{dc_num} - insufficient data")
+        results_dict[f'DC{dc_num}'] = dc_results
+        return
+    
+    print(f"Training sequences: {X_train_seq.shape}, Testing sequences: {X_test_seq.shape}")
     
     # Initialize sequence model builder
     seq_models = SequenceModels(
@@ -584,104 +574,153 @@ def main():
         n_classes=n_classes
     )
     
-    print("\n5. Training deep learning models on raw sequences...")
+    print(f"\nTraining deep learning models for DC{dc_num}...")
     
     # LSTM
+    print("  Training LSTM...")
     lstm_model = seq_models.build_lstm_model()
     lstm_hist, lstm_pred, lstm_acc = train_neural_network(
         lstm_model, X_train_seq, y_train_seq, X_test_seq, y_test_seq,
         model_name="LSTM", epochs=50
     )
-    results['LSTM (Sequences)'] = lstm_acc
+    dc_results[f'LSTM'] = lstm_acc
+    print(f"    Accuracy: {lstm_acc:.4f}")
     
     # 1D CNN
+    print("  Training 1D-CNN...")
     cnn_model = seq_models.build_cnn1d_model()
     cnn_hist, cnn_pred, cnn_acc = train_neural_network(
         cnn_model, X_train_seq, y_train_seq, X_test_seq, y_test_seq,
         model_name="1D-CNN", epochs=50
     )
-    results['1D-CNN (Sequences)'] = cnn_acc
+    dc_results[f'1D-CNN'] = cnn_acc
+    print(f"    Accuracy: {cnn_acc:.4f}")
     
     # CNN-LSTM
+    print("  Training CNN-LSTM...")
     cnn_lstm_model = seq_models.build_cnn_lstm_model()
     cnn_lstm_hist, cnn_lstm_pred, cnn_lstm_acc = train_neural_network(
         cnn_lstm_model, X_train_seq, y_train_seq, X_test_seq, y_test_seq,
         model_name="CNN-LSTM", epochs=50
     )
-    results['CNN-LSTM (Sequences)'] = cnn_lstm_acc
+    dc_results[f'CNN-LSTM'] = cnn_lstm_acc
+    print(f"    Accuracy: {cnn_lstm_acc:.4f}")
     
-    # Transformer
-    transformer_model = seq_models.build_transformer_model()
-    trans_hist, trans_pred, trans_acc = train_neural_network(
-        transformer_model, X_train_seq, y_train_seq, X_test_seq, y_test_seq,
-        model_name="Transformer", epochs=50
-    )
-    results['Transformer (Sequences)'] = trans_acc
+    # Find best model for this DC
+    best_model = max(dc_results, key=dc_results.get)
+    best_acc = dc_results[best_model]
     
-    # =========================================================================
-    # FINAL COMPARISON
-    # =========================================================================
-    print("\n" + "=" * 80)
-    print("FINAL RESULTS COMPARISON")
+    print(f"\nBest model for DC{dc_num}: {best_model} (Accuracy: {best_acc:.4f})")
+    
+    # Store results
+    results_dict[f'DC{dc_num}'] = dc_results
+    
+    # Get best predictions for classification report
+    if best_model == 'XGBoost':
+        best_pred = xgb_pred
+        best_y_test = y_test
+    elif best_model == 'LightGBM':
+        best_pred = lgb_pred
+        best_y_test = y_test
+    elif best_model == 'Random Forest':
+        best_pred = rf_pred
+        best_y_test = y_test
+    elif best_model == 'MLP':
+        best_pred = mlp_pred
+        best_y_test = y_test
+    elif best_model == 'LSTM':
+        best_pred = lstm_pred
+        best_y_test = y_test_seq
+    elif best_model == '1D-CNN':
+        best_pred = cnn_pred
+        best_y_test = y_test_seq
+    else:  # CNN-LSTM
+        best_pred = cnn_lstm_pred
+        best_y_test = y_test_seq
+    
+    # Print classification report
+    label_encoder = processor.dc1_label_encoder if dc_num == 1 else processor.dc2_label_encoder
+    print(f"\nClassification Report for DC{dc_num} ({best_model}):")
+    print(classification_report(best_y_test, best_pred, 
+                              target_names=label_encoder.classes_))
+
+# =============================================================================
+# 6. MAIN EXECUTION SCRIPT
+# =============================================================================
+
+def main(filepath='power_data.parquet'):
+    """
+    Main execution function for dual DC system classification
+    """
+    print("=" * 80)
+    print("DUAL DC POWER SYSTEM CLASSIFICATION")
+    print("Comparing Feature Engineering vs Raw Sequences")
     print("=" * 80)
     
-    print("\nPath A - Engineered Features:")
-    for model_name, accuracy in results.items():
-        if "Features" in model_name:
-            print(f"   {model_name:30} {accuracy:.4f}")
+    # Load data
+    df = load_power_data(filepath)
     
-    print("\nPath B - Raw Sequences:")
-    for model_name, accuracy in results.items():
-        if "Sequences" in model_name:
-            print(f"   {model_name:30} {accuracy:.4f}")
+    # Initialize processor
+    processor = DualDCPowerDataProcessor(window_size=100, stride=20)
     
-    best_model = max(results, key=results.get)
-    print(f"\n🏆 Best Overall Model: {best_model}")
-    print(f"   Accuracy: {results[best_model]:.4f}")
-    
-    # Get best model predictions for detailed report
-    if "XGBoost" in best_model:
-        best_pred = xgb_pred
-    elif "LightGBM" in best_model:
-        best_pred = lgb_pred
-    elif "Random Forest" in best_model:
-        best_pred = rf_pred
-    elif "MLP" in best_model:
-        best_pred = mlp_pred
-    elif "LSTM" in best_model and "CNN" not in best_model:
-        best_pred = lstm_pred
-    elif "1D-CNN" in best_model:
-        best_pred = cnn_pred
-    elif "CNN-LSTM" in best_model:
-        best_pred = cnn_lstm_pred
+    # Determine test runs for splitting
+    if 'test_run' in df.columns:
+        unique_runs = df['test_run'].unique()
+        n_test_runs = max(1, int(len(unique_runs) * 0.3))
+        test_runs = np.random.choice(unique_runs, n_test_runs, replace=False)
+        print(f"\nUsing test runs {sorted(test_runs)} for testing")
     else:
-        best_pred = trans_pred
+        # If no test_run column, use random split
+        print("\nNo 'test_run' column found, will use time-based splitting")
+        # Create synthetic test runs based on time chunks
+        df['test_run'] = pd.qcut(range(len(df)), q=10, labels=False)
+        unique_runs = df['test_run'].unique()
+        n_test_runs = 3
+        test_runs = np.random.choice(unique_runs, n_test_runs, replace=False)
     
-    # Use the appropriate test labels
-    if "Features" in best_model:
-        test_labels = y_test
+    # Store all results
+    all_results = {}
+    
+    # Train models for DC1
+    if all(col in df.columns for col in ['dc1_voltage', 'dc1_current', 'dc1_status']):
+        train_models_for_dc(processor, df, dc_num=1, test_runs=test_runs, results_dict=all_results)
     else:
-        test_labels = y_test_seq
+        print("\nDC1 columns not found, skipping DC1 processing")
     
-    print(f"\nDetailed Classification Report for {best_model}:")
-    print(classification_report(test_labels, best_pred, 
-                              target_names=processor.label_encoder.classes_))
+    # Train models for DC2
+    if all(col in df.columns for col in ['dc2_voltage', 'dc2_current', 'dc2_status']):
+        train_models_for_dc(processor, df, dc_num=2, test_runs=test_runs, results_dict=all_results)
+    else:
+        print("\nDC2 columns not found, skipping DC2 processing")
     
-    # Feature importance for tree-based models
-    if "XGBoost" in best_model or "LightGBM" in best_model or "Random Forest" in best_model:
-        print("\nTop 10 Most Important Features:")
-        if "XGBoost" in best_model:
-            importance = xgb_model.feature_importances_
-        elif "LightGBM" in best_model:
-            importance = lgb_model.feature_importances_
-        else:
-            importance = rf_model.feature_importances_
+    # Final summary
+    print("\n" + "=" * 80)
+    print("FINAL RESULTS SUMMARY")
+    print("=" * 80)
+    
+    for dc_system, results in all_results.items():
+        print(f"\n{dc_system} Results:")
+        print("-" * 40)
         
-        indices = np.argsort(importance)[::-1][:10]
-        for i, idx in enumerate(indices):
-            print(f"   {i+1}. Feature {idx}: {importance[idx]:.4f}")
+        # Separate by approach
+        feature_models = {k: v for k, v in results.items() if k in ['XGBoost', 'LightGBM', 'Random Forest', 'MLP']}
+        sequence_models = {k: v for k, v in results.items() if k in ['LSTM', '1D-CNN', 'CNN-LSTM']}
+        
+        if feature_models:
+            print("  Engineered Features:")
+            for model, acc in feature_models.items():
+                print(f"    {model:20} {acc:.4f}")
+        
+        if sequence_models:
+            print("  Raw Sequences:")
+            for model, acc in sequence_models.items():
+                print(f"    {model:20} {acc:.4f}")
+        
+        best_model = max(results, key=results.get)
+        print(f"\n  🏆 Best: {best_model} ({results[best_model]:.4f})")
     
-    return results
+    return all_results
 
 if __name__ == "__main__":
-    results = main()
+    # Change this to your parquet file path
+    results = main('your_power_data.parquet')
