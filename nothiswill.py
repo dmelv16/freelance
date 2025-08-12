@@ -12,80 +12,40 @@ import os
 # PART 1: ENHANCED VOLTAGE CLASSIFICATION FUNCTIONS
 # ============================================================================
 
-def detect_elbow_points(voltage_data: np.ndarray, window_size=10):
+def find_variance_transition(voltage_data: np.ndarray, window_size=20):
     """
-    Enhanced elbow detection using multiple methods for better accuracy.
+    Find where variance stabilizes - the transition from high to low variance.
+    This is often the best indicator of the stabilizing->steady transition.
     """
-    if len(voltage_data) < window_size * 3:
-        return []
+    if len(voltage_data) < window_size * 2:
+        return None
     
-    elbows = []
+    # Calculate rolling variance
+    variances = []
+    for i in range(len(voltage_data) - window_size):
+        window = voltage_data[i:i+window_size]
+        variances.append(np.var(window))
     
-    # Method 1: Curvature analysis (original)
-    smoothed = uniform_filter1d(voltage_data, size=5, mode='nearest')
-    first_deriv = np.gradient(smoothed)
-    second_deriv = np.gradient(first_deriv)
-    curvature = np.abs(second_deriv) / (1 + first_deriv**2)**1.5
+    variances = np.array(variances)
     
-    # More selective peak detection
-    curvature_threshold = np.percentile(curvature[curvature > 0], 80)
-    peaks1, _ = signal.find_peaks(curvature, 
-                                  height=curvature_threshold,
-                                  distance=window_size,
-                                  prominence=curvature_threshold/2)
-    elbows.extend(peaks1)
+    # Find where variance drops and stays low
+    median_var = np.median(variances)
+    low_var_threshold = median_var * 0.5  # Points with variance below this are "stable"
     
-    # Method 2: Slope change detection
-    # Look for points where the rate of change significantly shifts
-    slope_window = min(15, len(voltage_data) // 10)
-    if len(voltage_data) > slope_window * 2:
-        slopes = []
-        for i in range(len(voltage_data) - slope_window):
-            segment = voltage_data[i:i+slope_window]
-            slope = np.polyfit(np.arange(len(segment)), segment, 1)[0]
-            slopes.append(slope)
-        
-        slopes = np.array(slopes)
-        slope_change = np.abs(np.diff(slopes))
-        
-        # Find significant slope changes
-        slope_threshold = np.percentile(slope_change[slope_change > 0], 70)
-        peaks2, _ = signal.find_peaks(slope_change,
-                                      height=slope_threshold,
-                                      distance=window_size)
-        elbows.extend(peaks2 + slope_window // 2)  # Adjust for window offset
+    # Find the first sustained low-variance region
+    consecutive_low = 0
+    min_consecutive = window_size // 2  # Need at least this many consecutive low-variance windows
     
-    # Method 3: Variance change detection
-    # Look for transitions between high and low variance regions
-    var_window = min(20, len(voltage_data) // 8)
-    if len(voltage_data) > var_window * 2:
-        variances = []
-        for i in range(len(voltage_data) - var_window):
-            segment = voltage_data[i:i+var_window]
-            variances.append(np.var(segment))
-        
-        variances = np.array(variances)
-        var_change = np.abs(np.diff(variances))
-        
-        # Find significant variance changes
-        if np.any(var_change > 0):
-            var_threshold = np.percentile(var_change[var_change > 0], 60)
-            peaks3, _ = signal.find_peaks(var_change,
-                                          height=var_threshold,
-                                          distance=window_size)
-            elbows.extend(peaks3 + var_window // 2)
+    for i in range(len(variances)):
+        if variances[i] < low_var_threshold:
+            consecutive_low += 1
+            if consecutive_low >= min_consecutive:
+                # Found stable region, return where it started
+                return i - consecutive_low + window_size // 2
+        else:
+            consecutive_low = 0
     
-    # Remove duplicates and sort
-    elbows = list(set(elbows))
-    elbows.sort()
-    
-    # Filter out elbows that are too close to each other
-    filtered_elbows = []
-    for elbow in elbows:
-        if not filtered_elbows or elbow - filtered_elbows[-1] > window_size:
-            filtered_elbows.append(elbow)
-    
-    return filtered_elbows
+    return None
 
 def calculate_stability_score(segment: np.ndarray, window_size=5):
     """
@@ -146,19 +106,15 @@ def find_stable_region(voltage_data: np.ndarray, min_length=20):
 
 def classify_voltage_channel(voltage_series: pd.Series):
     """
-    Enhanced classifier with better elbow precision and noise tolerance.
+    Simplified classifier focused on variance-based detection.
+    Finds where data transitions from variable to stable.
     """
-    # --- Tunable Parameters (ADJUSTED FOR BETTER ACCURACY) ---
+    # --- Parameters ---
     MINIMUM_VOLTAGE = 2.2  
-    STEADY_VOLTAGE_THRESHOLD = 22.0  
-    STABILITY_WINDOW = 15
-    TREND_THRESHOLD = 0.015  # Reduced for more tolerance
-    VARIANCE_MULTIPLIER = 4.0  # Increased for more tolerance to minor fluctuations
-    SETTLE_THRESHOLD = 0.2  # More sensitive to subtle settling
-    END_BUFFER_POINTS = 15
-    CURVATURE_WINDOW = 10
-    NOISE_TOLERANCE = 0.05  # New: tolerance for minor fluctuations
-    MIN_STABLE_LENGTH = 30  # Minimum length to consider as steady state
+    VARIANCE_WINDOW = 20  # Window for variance calculation
+    STABILITY_RATIO = 0.3  # Variance must drop to this ratio of initial variance
+    MIN_STABILIZING_POINTS = 15  # Minimum points to classify as stabilizing
+    END_CHECK_WINDOW = 30  # Check last N points for end destabilization
     
     # --- Setup ---
     voltage = pd.to_numeric(voltage_series, errors='coerce').values
@@ -175,158 +131,139 @@ def classify_voltage_channel(voltage_series: pd.Series):
     energized_voltage = voltage[start_idx : end_idx + 1]
     energized_length = len(energized_voltage)
     
-    if energized_length < 30:
+    # Too short - all stabilizing
+    if energized_length < VARIANCE_WINDOW * 2:
         status[start_idx : end_idx + 1] = 'Stabilizing'
         return pd.Series(status)
     
-    # --- STEP 1: FIND THE MOST STABLE REGION ---
-    stable_start, stable_end = find_stable_region(energized_voltage, min_length=20)
+    # --- MAIN ALGORITHM: Find where variance drops and stays low ---
     
-    if stable_start >= stable_end:
+    # Step 1: Calculate rolling variance
+    variances = []
+    for i in range(energized_length - VARIANCE_WINDOW + 1):
+        window = energized_voltage[i:i+VARIANCE_WINDOW]
+        variances.append(np.var(window))
+    
+    if len(variances) == 0:
         status[start_idx : end_idx + 1] = 'Stabilizing'
         return pd.Series(status)
     
-    stable_voltage = energized_voltage[stable_start:stable_end]
-    stable_mean = np.mean(stable_voltage)
-    stable_std = max(np.std(stable_voltage), 0.01)
+    variances = np.array(variances)
     
-    # Calculate noise floor - the typical variation in the stable region
-    noise_floor = stable_std * 2  # Adaptive noise threshold
+    # Step 2: Find the baseline stable variance (from the most stable part)
+    # Use the 25th percentile of variances as our "stable" benchmark
+    stable_variance = np.percentile(variances, 25)
     
-    # --- STEP 2: DETECT ELBOW POINTS WITH ENHANCED METHOD ---
-    elbow_points = detect_elbow_points(energized_voltage, window_size=CURVATURE_WINDOW)
+    # Step 3: Find transition point where variance drops below threshold
+    # We're looking for where variance becomes consistently low
+    variance_threshold = stable_variance * 3  # Allow 3x the stable variance
     
-    # --- STEP 3: INITIAL CLASSIFICATION ---
+    # Initialize all as stabilizing
     local_status = np.full(energized_length, 'Stabilizing', dtype=object)
-    local_status[stable_start:stable_end] = 'Steady State'
     
-    # --- STEP 4: REFINE BEGINNING TRANSITION ---
-    if stable_start > 0:
-        early_voltage = energized_voltage[:min(30, stable_start)]
-        early_mean = np.mean(early_voltage)
-        
-        # Check for settling pattern (high to low)
-        if early_mean > stable_mean + SETTLE_THRESHOLD:
-            # This is a settle-down pattern
-            best_transition = 0
+    # Find the first point where variance drops and stays low
+    transition_found = False
+    consecutive_stable = 0
+    required_consecutive = 5  # Need 5 consecutive low-variance windows
+    
+    for i in range(len(variances)):
+        if variances[i] <= variance_threshold:
+            consecutive_stable += 1
+            if consecutive_stable >= required_consecutive and not transition_found:
+                # Found the transition point
+                transition_point = i  # This corresponds to the start of the window
+                transition_found = True
+                # Mark everything from here as steady state
+                local_status[transition_point:] = 'Steady State'
+                break
+        else:
+            consecutive_stable = 0
+    
+    # Step 4: Refine the transition for specific patterns
+    
+    # Check for settle-down pattern (starts high, decreases to steady)
+    if transition_found and transition_point > MIN_STABILIZING_POINTS:
+        # Look at the slope in the beginning
+        early_segment = energized_voltage[:transition_point]
+        if len(early_segment) > 10:
+            early_slope = np.polyfit(np.arange(len(early_segment)), early_segment, 1)[0]
             
-            # Find the best transition point
-            for i in range(min(stable_start, energized_length - STABILITY_WINDOW)):
-                window = energized_voltage[i : i + STABILITY_WINDOW]
-                window_mean = np.mean(window)
-                window_std = np.std(window)
-                
-                # Check if we've reached steady state
-                if (abs(window_mean - stable_mean) < noise_floor and 
-                    window_std < noise_floor):
-                    best_transition = i
-                    break
-            
-            # Check if any elbow point is better
-            for elbow in elbow_points:
-                if 0 < elbow < stable_start:
-                    # Verify this elbow is actually the transition
-                    before_elbow = energized_voltage[max(0, elbow-10):elbow]
-                    after_elbow = energized_voltage[elbow:min(elbow+10, energized_length)]
+            # If clearly decreasing, find where it actually levels off
+            if early_slope < -0.01:  # Significant downward slope
+                # Find where the decrease stops
+                for i in range(min(transition_point, energized_length - 10)):
+                    window = energized_voltage[i:i+10]
+                    window_slope = np.polyfit(np.arange(10), window, 1)[0]
                     
-                    if (len(before_elbow) > 0 and len(after_elbow) > 0):
-                        before_mean = np.mean(before_elbow)
-                        after_mean = np.mean(after_elbow)
-                        
-                        # Significant change at elbow
-                        if abs(before_mean - after_mean) > NOISE_TOLERANCE:
-                            best_transition = elbow
-            
-            local_status[:best_transition] = 'Stabilizing'
-            local_status[best_transition:stable_end] = 'Steady State'
-            
-        # Check for ramp-up pattern (low to high)
-        elif early_mean < stable_mean - SETTLE_THRESHOLD:
-            # This is a ramp-up pattern
-            best_transition = stable_start
-            
-            # Find where voltage reaches near steady state
-            for i in range(stable_start):
-                if energized_voltage[i] >= stable_mean - noise_floor:
-                    best_transition = i
-                    break
-            
-            # Check elbows for better transition
-            for elbow in elbow_points:
-                if 0 < elbow < stable_start:
-                    if energized_voltage[elbow] >= stable_mean - noise_floor * 1.5:
-                        best_transition = elbow
+                    # Slope has flattened
+                    if abs(window_slope) < 0.005:
+                        local_status[:i] = 'Stabilizing'
+                        local_status[i:] = 'Steady State'
+                        transition_point = i
                         break
-            
-            local_status[:best_transition] = 'Stabilizing'
-            local_status[best_transition:stable_end] = 'Steady State'
     
-    # --- STEP 5: PRECISE END-OF-SIGNAL CHECK ---
-    if stable_end < energized_length - END_BUFFER_POINTS:
-        end_segment = energized_voltage[stable_end:]
-        
-        if len(end_segment) > 10:
-            end_mean = np.mean(end_segment)
-            end_std = np.std(end_segment)
+    # Check for ramp-up pattern (starts low, increases to steady)
+    if transition_found and transition_point > MIN_STABILIZING_POINTS:
+        early_segment = energized_voltage[:transition_point]
+        if len(early_segment) > 10:
+            early_slope = np.polyfit(np.arange(len(early_segment)), early_segment, 1)[0]
             
-            # Only mark as stabilizing if there's significant change
-            if (abs(stable_mean - end_mean) > noise_floor or 
-                end_std > noise_floor * 2):
-                
-                # Find where the change begins
-                for i in range(stable_end, energized_length):
-                    if abs(energized_voltage[i] - stable_mean) > noise_floor:
+            # If clearly increasing, find where it levels off
+            if early_slope > 0.01:  # Significant upward slope
+                # Find where the increase stops
+                for i in range(min(transition_point, energized_length - 10)):
+                    window = energized_voltage[i:i+10]
+                    window_slope = np.polyfit(np.arange(10), window, 1)[0]
+                    
+                    # Slope has flattened
+                    if abs(window_slope) < 0.005:
+                        local_status[:i] = 'Stabilizing'
+                        local_status[i:] = 'Steady State'
+                        transition_point = i
+                        break
+    
+    # Step 5: Check the end for destabilization
+    if energized_length > END_CHECK_WINDOW and transition_found:
+        end_segment = energized_voltage[-END_CHECK_WINDOW:]
+        end_variance = np.var(end_segment)
+        
+        # Also check for significant voltage drop at the end
+        middle_voltage = np.mean(energized_voltage[energized_length//2:energized_length//2+20])
+        end_voltage = np.mean(end_segment)
+        
+        # If end variance is high OR voltage dropped significantly
+        if end_variance > variance_threshold * 2 or (middle_voltage - end_voltage) > 0.5:
+            # Find where the destabilization starts
+            for i in range(energized_length - END_CHECK_WINDOW, energized_length):
+                remaining = energized_voltage[i:]
+                if len(remaining) > 5:
+                    remaining_var = np.var(remaining)
+                    if remaining_var > variance_threshold * 1.5:
                         local_status[i:] = 'Stabilizing'
                         break
     
-    # --- STEP 6: SMOOTH OUT NOISE ---
-    # Prevent over-classification of minor fluctuations
-    # Use a sliding window to smooth classifications
-    smooth_window = 10
-    for i in range(smooth_window, energized_length - smooth_window):
-        if local_status[i] == 'Stabilizing':
-            # Check if this is just noise in an otherwise stable region
-            surrounding = local_status[i-smooth_window:i+smooth_window+1]
-            steady_count = np.sum(surrounding == 'Steady State')
-            
-            # If mostly surrounded by steady state, this is probably noise
-            if steady_count > len(surrounding) * 0.7:
-                # Verify it's actually stable
-                segment = energized_voltage[i-5:i+6] if i >= 5 and i < energized_length-5 else energized_voltage[i:i+1]
-                if np.std(segment) < noise_floor:
-                    local_status[i] = 'Steady State'
+    # Step 6: Handle edge cases
     
-    # --- STEP 7: ENFORCE MINIMUM LENGTHS ---
-    # Prevent very short steady state regions
-    current_state = local_status[0]
-    state_start = 0
+    # If no transition was found but variance is generally low, it might all be steady
+    if not transition_found:
+        overall_variance = np.var(energized_voltage)
+        if overall_variance < stable_variance * 2:
+            # Low variance throughout - probably all steady state
+            local_status[:] = 'Steady State'
+        else:
+            # High variance throughout - probably all stabilizing
+            local_status[:] = 'Stabilizing'
     
-    for i in range(1, energized_length):
-        if local_status[i] != current_state:
-            state_length = i - state_start
-            
-            # If steady state region is too short, convert to stabilizing
-            if current_state == 'Steady State' and state_length < MIN_STABLE_LENGTH:
-                # Unless it's in the main stable region
-                if not (state_start <= stable_start and i >= stable_end):
-                    local_status[state_start:i] = 'Stabilizing'
-            
-            current_state = local_status[i]
-            state_start = i
+    # Ensure minimum stabilizing period at the start unless it's already stable
+    if transition_found and transition_point < MIN_STABILIZING_POINTS:
+        # Check if the beginning is actually already stable
+        initial_variance = np.var(energized_voltage[:MIN_STABILIZING_POINTS])
+        if initial_variance > stable_variance * 3:
+            # High initial variance, enforce minimum stabilizing period
+            local_status[:MIN_STABILIZING_POINTS] = 'Stabilizing'
+            local_status[MIN_STABILIZING_POINTS:] = 'Steady State'
     
-    # --- STEP 8: FINAL VALIDATION ---
-    # Ensure we're not over-classifying the beginning or end
-    # The first 10 points should be stabilizing unless voltage is already at steady state
-    if energized_length > 10:
-        first_10 = energized_voltage[:10]
-        if np.std(first_10) > noise_floor or abs(np.mean(first_10) - stable_mean) > noise_floor:
-            for i in range(min(10, energized_length)):
-                if abs(energized_voltage[i] - stable_mean) > noise_floor:
-                    local_status[i] = 'Stabilizing'
-                else:
-                    break  # Stop when we reach steady state
-    
-    # Map local status back to full array
+    # Map back to full array
     status[start_idx : end_idx + 1] = local_status
     
     return pd.Series(status)
