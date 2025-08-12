@@ -8,102 +8,6 @@ from collections import defaultdict
 from tqdm import tqdm
 import os
 
-# ============================================================================
-# PART 1: ENHANCED VOLTAGE CLASSIFICATION FUNCTIONS
-# ============================================================================
-
-def find_variance_transition(voltage_data: np.ndarray, window_size=20):
-    """
-    Find where variance stabilizes - the transition from high to low variance.
-    This is often the best indicator of the stabilizing->steady transition.
-    """
-    if len(voltage_data) < window_size * 2:
-        return None
-    
-    # Calculate rolling variance
-    variances = []
-    for i in range(len(voltage_data) - window_size):
-        window = voltage_data[i:i+window_size]
-        variances.append(np.var(window))
-    
-    variances = np.array(variances)
-    
-    # Find where variance drops and stays low
-    median_var = np.median(variances)
-    low_var_threshold = median_var * 0.5  # Points with variance below this are "stable"
-    
-    # Find the first sustained low-variance region
-    consecutive_low = 0
-    min_consecutive = window_size // 2  # Need at least this many consecutive low-variance windows
-    
-    for i in range(len(variances)):
-        if variances[i] < low_var_threshold:
-            consecutive_low += 1
-            if consecutive_low >= min_consecutive:
-                # Found stable region, return where it started
-                return i - consecutive_low + window_size // 2
-        else:
-            consecutive_low = 0
-    
-    return None
-
-def calculate_stability_score(segment: np.ndarray, window_size=5):
-    """
-    Calculate how stable a segment is using multiple metrics.
-    Lower score = more stable.
-    """
-    if len(segment) < window_size:
-        return float('inf')
-    
-    # Multiple stability metrics
-    std_dev = np.std(segment)
-    range_val = np.ptp(segment)  # peak-to-peak range
-    
-    # Rolling variance to detect local instabilities
-    if len(segment) > window_size:
-        rolling_std = pd.Series(segment).rolling(window_size, center=True).std()
-        max_local_std = np.nanmax(rolling_std)
-    else:
-        max_local_std = std_dev
-    
-    # Trend component (penalize segments with strong trends)
-    if len(segment) > 1:
-        trend = np.abs(np.polyfit(np.arange(len(segment)), segment, 1)[0])
-    else:
-        trend = 0
-    
-    # Combined stability score (lower is better)
-    stability_score = std_dev + 0.5 * range_val + 0.3 * max_local_std + 2 * trend
-    return stability_score
-
-def find_stable_region(voltage_data: np.ndarray, min_length=20):
-    """
-    Find the most stable continuous region in the voltage data.
-    This helps identify the true steady-state period.
-    """
-    n = len(voltage_data)
-    if n < min_length:
-        return 0, n
-    
-    best_score = float('inf')
-    best_start, best_end = 0, n
-    
-    # Use a sliding window to find the most stable region
-    for window_size in [min_length, min_length * 2, min_length * 3]:
-        if window_size > n:
-            continue
-            
-        for i in range(n - window_size + 1):
-            segment = voltage_data[i:i + window_size]
-            score = calculate_stability_score(segment)
-            
-            if score < best_score:
-                best_score = score
-                best_start = i
-                best_end = i + window_size
-    
-    return best_start, best_end
-
 def classify_voltage_channel(voltage_series: pd.Series):
     """
     Simplified classifier focused on variance-based detection.
@@ -121,150 +25,183 @@ def classify_voltage_channel(voltage_series: pd.Series):
     n = len(voltage)
     status = np.full(n, 'De-energized', dtype=object)
     
-    # Find energized region
+    # Find ALL points that meet the energized criteria
     energized_mask = (voltage >= MINIMUM_VOLTAGE) & (~np.isnan(voltage))
+    
     if not np.any(energized_mask):
         return pd.Series(status)
     
+    # Get indices of energized points
     energized_indices = np.where(energized_mask)[0]
+    
+    # If there are gaps in energized data, we should handle continuous segments
+    # For now, let's work with the continuous segment from first to last energized point
     start_idx, end_idx = energized_indices[0], energized_indices[-1]
+    
+    # Create a mask for the continuous region (including any gaps)
+    continuous_region_mask = np.zeros(n, dtype=bool)
+    continuous_region_mask[start_idx:end_idx + 1] = True
+    
+    # Within this region, mark all points >= MINIMUM_VOLTAGE as needing classification
+    # This ensures ALL points meeting voltage criteria get classified
+    points_to_classify = continuous_region_mask & energized_mask
+    
+    # Extract the continuous voltage segment for analysis
     energized_voltage = voltage[start_idx : end_idx + 1]
     energized_length = len(energized_voltage)
     
-    # Too short - all stabilizing
+    # Create local status array for the continuous segment
+    local_status = np.full(energized_length, 'De-energized', dtype=object)
+    
+    # Mark energized points within the local segment
+    local_energized_mask = energized_mask[start_idx : end_idx + 1]
+    
+    # Too short - all stabilizing for energized points
     if energized_length < VARIANCE_WINDOW * 2:
-        status[start_idx : end_idx + 1] = 'Stabilizing'
+        local_status[local_energized_mask] = 'Stabilizing'
+        status[start_idx : end_idx + 1] = local_status
         return pd.Series(status)
     
     # --- MAIN ALGORITHM: Find where variance drops and stays low ---
     
-    # Step 1: Calculate rolling variance
+    # Step 1: Calculate rolling variance (only for valid/energized windows)
     variances = []
+    variance_positions = []
+    
     for i in range(energized_length - VARIANCE_WINDOW + 1):
         window = energized_voltage[i:i+VARIANCE_WINDOW]
-        variances.append(np.var(window))
+        window_mask = local_energized_mask[i:i+VARIANCE_WINDOW]
+        
+        # Only calculate variance if enough valid points in window
+        if np.sum(window_mask) >= VARIANCE_WINDOW * 0.8:  # At least 80% valid points
+            valid_window = window[window_mask]
+            variances.append(np.var(valid_window))
+            variance_positions.append(i)
     
     if len(variances) == 0:
-        status[start_idx : end_idx + 1] = 'Stabilizing'
+        local_status[local_energized_mask] = 'Stabilizing'
+        status[start_idx : end_idx + 1] = local_status
         return pd.Series(status)
     
     variances = np.array(variances)
     
-    # Step 2: Find the baseline stable variance (from the most stable part)
-    # Use the 25th percentile of variances as our "stable" benchmark
+    # Step 2: Find the baseline stable variance
     stable_variance = np.percentile(variances, 25)
     
     # Step 3: Find transition point where variance drops below threshold
-    # We're looking for where variance becomes consistently low
-    variance_threshold = stable_variance * 3  # Allow 3x the stable variance
+    variance_threshold = stable_variance * 3
     
-    # Initialize all as stabilizing
-    local_status = np.full(energized_length, 'Stabilizing', dtype=object)
+    # Initialize all energized points as stabilizing
+    local_status[local_energized_mask] = 'Stabilizing'
     
     # Find the first point where variance drops and stays low
     transition_found = False
     consecutive_stable = 0
-    required_consecutive = 5  # Need 5 consecutive low-variance windows
+    required_consecutive = 5
+    transition_point = -1
     
-    for i in range(len(variances)):
+    for i, pos in enumerate(variance_positions):
         if variances[i] <= variance_threshold:
             consecutive_stable += 1
             if consecutive_stable >= required_consecutive and not transition_found:
-                # Found the transition point
-                transition_point = i  # This corresponds to the start of the window
+                transition_point = pos
                 transition_found = True
-                # Mark everything from here as steady state
-                local_status[transition_point:] = 'Steady State'
+                # Mark energized points from here as steady state
+                steady_mask = local_energized_mask.copy()
+                steady_mask[:transition_point] = False
+                local_status[steady_mask] = 'Steady State'
                 break
         else:
             consecutive_stable = 0
     
     # Step 4: Refine the transition for specific patterns
-    
-    # Check for settle-down pattern (starts high, decreases to steady)
     if transition_found and transition_point > MIN_STABILIZING_POINTS:
-        # Look at the slope in the beginning
-        early_segment = energized_voltage[:transition_point]
-        if len(early_segment) > 10:
-            early_slope = np.polyfit(np.arange(len(early_segment)), early_segment, 1)[0]
+        # Get only the energized values for slope calculation
+        energized_only_indices = np.where(local_energized_mask)[0]
+        if len(energized_only_indices) > 10:
+            # Check for settle-down or ramp-up patterns
+            early_indices = energized_only_indices[energized_only_indices < transition_point]
             
-            # If clearly decreasing, find where it actually levels off
-            if early_slope < -0.01:  # Significant downward slope
-                # Find where the decrease stops
-                for i in range(min(transition_point, energized_length - 10)):
-                    window = energized_voltage[i:i+10]
-                    window_slope = np.polyfit(np.arange(10), window, 1)[0]
-                    
-                    # Slope has flattened
-                    if abs(window_slope) < 0.005:
-                        local_status[:i] = 'Stabilizing'
-                        local_status[i:] = 'Steady State'
-                        transition_point = i
-                        break
-    
-    # Check for ramp-up pattern (starts low, increases to steady)
-    if transition_found and transition_point > MIN_STABILIZING_POINTS:
-        early_segment = energized_voltage[:transition_point]
-        if len(early_segment) > 10:
-            early_slope = np.polyfit(np.arange(len(early_segment)), early_segment, 1)[0]
-            
-            # If clearly increasing, find where it levels off
-            if early_slope > 0.01:  # Significant upward slope
-                # Find where the increase stops
-                for i in range(min(transition_point, energized_length - 10)):
-                    window = energized_voltage[i:i+10]
-                    window_slope = np.polyfit(np.arange(10), window, 1)[0]
-                    
-                    # Slope has flattened
-                    if abs(window_slope) < 0.005:
-                        local_status[:i] = 'Stabilizing'
-                        local_status[i:] = 'Steady State'
-                        transition_point = i
-                        break
+            if len(early_indices) > 10:
+                early_values = energized_voltage[early_indices]
+                early_slope = np.polyfit(np.arange(len(early_values)), early_values, 1)[0]
+                
+                # If significant slope (up or down), find where it levels off
+                if abs(early_slope) > 0.01:
+                    for j in range(len(energized_only_indices) - 10):
+                        window_indices = energized_only_indices[j:j+10]
+                        window_values = energized_voltage[window_indices]
+                        window_slope = np.polyfit(np.arange(10), window_values, 1)[0]
+                        
+                        if abs(window_slope) < 0.005:  # Slope has flattened
+                            actual_transition = window_indices[0]
+                            # Update classification
+                            for idx in energized_only_indices:
+                                if idx < actual_transition:
+                                    local_status[idx] = 'Stabilizing'
+                                else:
+                                    local_status[idx] = 'Steady State'
+                            transition_point = actual_transition
+                            break
     
     # Step 5: Check the end for destabilization
     if energized_length > END_CHECK_WINDOW and transition_found:
-        end_segment = energized_voltage[-END_CHECK_WINDOW:]
-        end_variance = np.var(end_segment)
-        
-        # Also check for significant voltage drop at the end
-        middle_voltage = np.mean(energized_voltage[energized_length//2:energized_length//2+20])
-        end_voltage = np.mean(end_segment)
-        
-        # If end variance is high OR voltage dropped significantly
-        if end_variance > variance_threshold * 2 or (middle_voltage - end_voltage) > 0.5:
-            # Find where the destabilization starts
-            for i in range(energized_length - END_CHECK_WINDOW, energized_length):
-                remaining = energized_voltage[i:]
-                if len(remaining) > 5:
-                    remaining_var = np.var(remaining)
-                    if remaining_var > variance_threshold * 1.5:
-                        local_status[i:] = 'Stabilizing'
-                        break
+        end_indices = np.where(local_energized_mask[-END_CHECK_WINDOW:])[0]
+        if len(end_indices) > 5:
+            end_values = energized_voltage[-END_CHECK_WINDOW:][end_indices]
+            end_variance = np.var(end_values)
+            
+            # Check for destabilization at the end
+            if end_variance > variance_threshold * 2:
+                # Mark the end portion as stabilizing
+                destab_start = energized_length - END_CHECK_WINDOW
+                for idx in range(destab_start, energized_length):
+                    if local_energized_mask[idx]:
+                        local_status[idx] = 'Stabilizing'
     
     # Step 6: Handle edge cases
-    
-    # If no transition was found but variance is generally low, it might all be steady
     if not transition_found:
-        overall_variance = np.var(energized_voltage)
-        if overall_variance < stable_variance * 2:
-            # Low variance throughout - probably all steady state
-            local_status[:] = 'Steady State'
-        else:
-            # High variance throughout - probably all stabilizing
-            local_status[:] = 'Stabilizing'
+        # Calculate overall variance for energized points only
+        energized_values = energized_voltage[local_energized_mask]
+        if len(energized_values) > 0:
+            overall_variance = np.var(energized_values)
+            if overall_variance < stable_variance * 2:
+                local_status[local_energized_mask] = 'Steady State'
+            else:
+                local_status[local_energized_mask] = 'Stabilizing'
     
-    # Ensure minimum stabilizing period at the start unless it's already stable
+    # Ensure minimum stabilizing period at the start
     if transition_found and transition_point < MIN_STABILIZING_POINTS:
-        # Check if the beginning is actually already stable
-        initial_variance = np.var(energized_voltage[:MIN_STABILIZING_POINTS])
-        if initial_variance > stable_variance * 3:
-            # High initial variance, enforce minimum stabilizing period
-            local_status[:MIN_STABILIZING_POINTS] = 'Stabilizing'
-            local_status[MIN_STABILIZING_POINTS:] = 'Steady State'
+        energized_indices_local = np.where(local_energized_mask)[0]
+        if len(energized_indices_local) >= MIN_STABILIZING_POINTS:
+            initial_indices = energized_indices_local[:MIN_STABILIZING_POINTS]
+            initial_values = energized_voltage[initial_indices]
+            initial_variance = np.var(initial_values)
+            
+            if initial_variance > stable_variance * 3:
+                # Enforce minimum stabilizing period
+                for idx in initial_indices:
+                    local_status[idx] = 'Stabilizing'
     
     # Map back to full array
     status[start_idx : end_idx + 1] = local_status
+    
+    # Final verification: ensure ALL points >= MINIMUM_VOLTAGE are classified
+    # This is the critical fix - make sure no energized points remain "De-energized"
+    for i in range(n):
+        if voltage[i] >= MINIMUM_VOLTAGE and not np.isnan(voltage[i]):
+            if status[i] == 'De-energized':
+                # This point should not be de-energized - assign based on context
+                # Look for nearby classified points
+                window_start = max(0, i - 10)
+                window_end = min(n, i + 10)
+                nearby_statuses = status[window_start:window_end]
+                
+                # If there are steady state points nearby, use steady state
+                if 'Steady State' in nearby_statuses:
+                    status[i] = 'Steady State'
+                else:
+                    status[i] = 'Stabilizing'
     
     return pd.Series(status)
 
@@ -288,55 +225,6 @@ def clean_dc_channels(group_df):
         df['dc2_status'] = 'De-energized'
     
     return df
-
-def analyze_voltage_profile(voltage_series: pd.Series):
-    """
-    Provides detailed analysis of the voltage profile to help tune parameters.
-    Useful for debugging and understanding your data patterns.
-    """
-    voltage = pd.to_numeric(voltage_series, errors='coerce').values
-    voltage_clean = voltage[~np.isnan(voltage)]
-    
-    if len(voltage_clean) == 0:
-        return "No valid voltage data"
-    
-    # Find stable region
-    energized_mask = voltage_clean >= 2.2
-    if not np.any(energized_mask):
-        return "No energized data found"
-    
-    energized = voltage_clean[energized_mask]
-    stable_start, stable_end = find_stable_region(energized)
-    
-    analysis = {
-        'total_points': len(voltage_clean),
-        'energized_points': len(energized),
-        'min_voltage': np.min(energized),
-        'max_voltage': np.max(energized),
-        'mean_voltage': np.mean(energized),
-        'std_voltage': np.std(energized),
-        'stable_region': (stable_start, stable_end),
-        'stable_mean': np.mean(energized[stable_start:stable_end]) if stable_start < stable_end else None,
-        'stable_std': np.std(energized[stable_start:stable_end]) if stable_start < stable_end else None,
-        'elbows_detected': len(detect_elbow_points(energized))
-    }
-    
-    # Detect pattern type
-    if len(energized) > 30:
-        early_mean = np.mean(energized[:15])
-        late_mean = np.mean(energized[-15:])
-        middle_mean = np.mean(energized[len(energized)//2 - 10 : len(energized)//2 + 10])
-        
-        if early_mean < middle_mean - 0.5:
-            analysis['pattern'] = 'Ramp-up'
-        elif early_mean > middle_mean + 0.5:
-            analysis['pattern'] = 'Settle-down'
-        elif late_mean < middle_mean - 0.5:
-            analysis['pattern'] = 'End ramp-down'
-        else:
-            analysis['pattern'] = 'Stable throughout'
-    
-    return analysis
 
 # ============================================================================
 # MAIN PROCESSING SCRIPT
