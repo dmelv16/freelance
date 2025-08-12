@@ -63,11 +63,31 @@ def classify_voltage_channel(voltage_series: pd.Series):
         # No points are above the threshold, so it's all stabilizing
         status[start_idx:end_idx + 1] = 'Stabilizing'
         return pd.Series(status)
-
+    # --- Inside classify_voltage_channel function ---
+    
+    # (Previous code remains the same up to this point)
+    
     # Calculate robust steady state characteristics
     steady_mean = np.mean(valid_sample)
     steady_std = np.std(valid_sample)
+    
+    # --- ADD THIS NEW BLOCK ---
+    # Refinement: To handle highly volatile signals, find the most stable region
+    # within our sample to calculate a more reliable steady state benchmark.
+    rolling_std_of_sample = pd.Series(valid_sample).rolling(window=10, min_periods=1).std()
+    # Use only the calmest 50% of the sample points for our calculation
+    calm_threshold = rolling_std_of_sample.quantile(0.5) 
+    stable_points_for_benchmark = valid_sample[rolling_std_of_sample <= calm_threshold]
+    
+    # Only use this refined sample if it's large enough to be reliable
+    if len(stable_points_for_benchmark) > 30:
+        steady_mean = np.mean(stable_points_for_benchmark)
+        steady_std = np.std(stable_points_for_benchmark)
+    # --- END OF NEW BLOCK ---
+    
     steady_std = max(steady_std, 0.01) # Avoid division by zero or near-zero std
+    
+    # (The rest of the function remains the same)
 
     # Define the tolerance band for steady state
     tolerance = STEADY_STATE_TOLERANCE_STD * steady_std
@@ -113,30 +133,3 @@ def classify_voltage_channel(voltage_series: pd.Series):
                 break
                 
     return pd.Series(status)
-
-
-# --- Inside classify_voltage_channel function ---
-
-# (Previous code remains the same up to this point)
-
-# Calculate robust steady state characteristics
-steady_mean = np.mean(valid_sample)
-steady_std = np.std(valid_sample)
-
-# --- ADD THIS NEW BLOCK ---
-# Refinement: To handle highly volatile signals, find the most stable region
-# within our sample to calculate a more reliable steady state benchmark.
-rolling_std_of_sample = pd.Series(valid_sample).rolling(window=10, min_periods=1).std()
-# Use only the calmest 50% of the sample points for our calculation
-calm_threshold = rolling_std_of_sample.quantile(0.5) 
-stable_points_for_benchmark = valid_sample[rolling_std_of_sample <= calm_threshold]
-
-# Only use this refined sample if it's large enough to be reliable
-if len(stable_points_for_benchmark) > 30:
-    steady_mean = np.mean(stable_points_for_benchmark)
-    steady_std = np.std(stable_points_for_benchmark)
-# --- END OF NEW BLOCK ---
-
-steady_std = max(steady_std, 0.01) # Avoid division by zero or near-zero std
-
-# (The rest of the function remains the same)
